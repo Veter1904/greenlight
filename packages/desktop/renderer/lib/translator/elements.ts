@@ -90,7 +90,7 @@ const GOOD_CONFIDENCE = 72
 // ... and covers at least this part of the place (the rest of a paragraph is tried in other ways)
 const GOOD_COVERAGE = 0.6
 // The picture in grey is tried (it takes time) only for places that look like text to the scout
-const RAW_MIN_SCORE = 120
+const RAW_MIN_SCORE = 50
 
 const LETTER = new RegExp('\\p{L}', 'gu')
 
@@ -859,9 +859,9 @@ export default class ElementsEngine {
         // The text colour the scout found first; when nothing is read, the other one (white text on a light bar looks dark)
         // and, when that does not work, the picture in grey (thin or faint letters are lost when it is cut into black and white)
         const other: Polarity = element.polarity === 'light' ? 'dark' : 'light'
-        const attempts: Array<[Polarity, boolean]> = [[element.polarity, false], [other, false]]
+        const attempts: Array<[Polarity, boolean | 'stretched']> = [[element.polarity, false], [other, false]]
         if(element.score >= RAW_MIN_SCORE){
-            attempts.push([element.polarity, true])
+            attempts.push([element.polarity, true], [element.polarity, 'stretched'])
         }
         let result: Awaited<ReturnType<TranslatorEngine['_read']>> = null
         let resultValue = 0

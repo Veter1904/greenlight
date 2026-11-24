@@ -1876,7 +1876,7 @@ export default class TranslatorEngine {
     }
 
     /** Reads the window with one text colour and turns the result into pieces of text with their position and colours. */
-    async _read(job: Snapshot, polarity: Polarity, raw = false): Promise<ReadResult | null> {
+    async _read(job: Snapshot, polarity: Polarity, raw: boolean | 'stretched' = false): Promise<ReadResult | null> {
         const source = job.source
         const prepared = await this._prepareForReading(job.canvas, source, polarity, raw)
         if(prepared === null){
@@ -2077,7 +2077,7 @@ export default class TranslatorEngine {
     }
 
     /** Crops the window from the video and turns it into black text on white, which is what the text reader likes. */
-    async _prepareForReading(frame: HTMLCanvasElement, source: SourceRect, polarity: Polarity, raw = false): Promise<PreparedImage | null> {
+    async _prepareForReading(frame: HTMLCanvasElement, source: SourceRect, polarity: Polarity, raw: boolean | 'stretched' = false): Promise<PreparedImage | null> {
         // Small interface text needs to be enlarged a lot to be read reliably
         let scale = Math.min(3, Math.max(2, 1300 / source.sw))
         // A big window (the whole screen) is not enlarged as much: the time of the reader grows with the number of pixels
@@ -2108,12 +2108,45 @@ export default class TranslatorEngine {
         const ink = (await inkMasksInSlices(data, width, height, [polarity], breathe))[0].mask
         await breathe()
 
-        if(raw){
+        if(raw === true){
             // The picture as it is, in grey with more contrast: thin or faint letters (a menu in a pale colour) are lost when the
             // picture is cut into black and white, and the reader does better on the grey one
             for(let i = 0; i < ink.length; i++){
                 const grey = (data[i * 4] * 299 + data[i * 4 + 1] * 587 + data[i * 4 + 2] * 114) / 1000
                 const value = Math.max(0, Math.min(255, (grey - 30) * 1.9))
+                data[i * 4] = value
+                data[i * 4 + 1] = value
+                data[i * 4 + 2] = value
+                data[i * 4 + 3] = 255
+            }
+        } else if(raw === 'stretched'){
+            // The contrast is stretched between the darkest and the brightest pixels of the place, and light letters are turned
+            // into dark ones on a light ground (the reader is far better at those than at light letters on a dark ground)
+            const histogram = new Uint32Array(256)
+            const greys = new Uint8Array(ink.length)
+            for(let i = 0; i < ink.length; i++){
+                const grey = Math.round((data[i * 4] * 299 + data[i * 4 + 1] * 587 + data[i * 4 + 2] * 114) / 1000)
+                greys[i] = grey
+                histogram[grey]++
+            }
+            const percentile = (share: number) => {
+                let sum = 0
+                for(let level = 0; level < 256; level++){
+                    sum += histogram[level]
+                    if(sum >= share * ink.length){
+                        return level
+                    }
+                }
+                return 255
+            }
+            const low = percentile(0.02)
+            const high = percentile(0.98)
+            const scale = 255 / Math.max(40, high - low)
+            for(let i = 0; i < ink.length; i++){
+                let value = Math.max(0, Math.min(255, (greys[i] - low) * scale))
+                if(polarity === 'light'){
+                    value = 255 - value
+                }
                 data[i * 4] = value
                 data[i * 4 + 1] = value
                 data[i * 4 + 2] = value
