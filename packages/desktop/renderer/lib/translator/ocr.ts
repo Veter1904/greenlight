@@ -194,8 +194,14 @@ export async function recognizeCanvas(canvas: HTMLCanvasElement, language = 'en'
     }
 }
 
+// How much reading was done (for the performance report of the Decky plugin)
+export const ocrStats = { reads: 0, ms: 0 }
+
 async function readCanvas(worker: Worker, canvas: HTMLCanvasElement, maxGap: number): Promise<OcrResult> {
+    const started = Date.now()
     const result = await worker.recognize(canvas, {}, { text: true, blocks: true })
+    ocrStats.reads++
+    ocrStats.ms += Date.now() - started
 
     const lines: OcrLine[] = []
 
