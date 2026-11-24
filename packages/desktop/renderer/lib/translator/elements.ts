@@ -94,6 +94,10 @@ const LETTER = new RegExp('\\p{L}', 'gu')
 interface Segment extends TranslatedSegment {
     template: string;
     shownAt: number;
+    // The colour of the interface behind the text as it was measured (the plate colours are made from it and the colour of the letters)
+    base?: [number, number, number];
+    // The colour of the letters now
+    ink?: [number, number, number];
 }
 
 interface Element {
@@ -156,6 +160,79 @@ function similarSize(a: Region, b: Region): boolean {
 function centralness(region: Region): number {
     const middle = center(region)
     return Math.max(0, 1 - Math.hypot((middle.x - 0.5) / 0.35, (middle.y - 0.5) / 0.35))
+}
+
+// How far the colour of the letters has to move before the plate takes the new colour
+const INK_CHANGED = 60
+// The letters have to differ at least this much in brightness from the plate, or the plate is made darker / lighter
+const INK_CONTRAST = 110
+
+function brightnessOf(color: number[]): number {
+    return (color[0] * 299 + color[1] * 587 + color[2] * 114) / 1000
+}
+
+// A pixel is "coloured" when its brightest and darkest channel are this far apart (the yellow of a letter, not the grey of a picture)
+const CHROMA = 90
+
+/**
+ * The colour of the letters in a place of the picture, or null when there is not enough to tell. Letters that are drawn with
+ * a dark outline (a lot of games) are found by their outline, so the mask alone would give black: when the place has coloured
+ * pixels, their mean is the colour of the letters; otherwise it is the mean of the text mask.
+ */
+function inkColor(pixels: Uint8ClampedArray, mask: Uint8Array, width: number, height: number, box: Region): [number, number, number] | null {
+    const x0 = Math.max(0, Math.floor(box.x * width))
+    const y0 = Math.max(0, Math.floor(box.y * height))
+    const x1 = Math.min(width, Math.ceil((box.x + box.w) * width))
+    const y1 = Math.min(height, Math.ceil((box.y + box.h) * height))
+    let r = 0
+    let g = 0
+    let b = 0
+    let count = 0
+    let cr = 0
+    let cg = 0
+    let cb = 0
+    let colored = 0
+    for(let y = y0; y < y1; y++){
+        for(let x = x0; x < x1; x++){
+            const i = y * width + x
+            const pr = pixels[i * 4]
+            const pg = pixels[i * 4 + 1]
+            const pb = pixels[i * 4 + 2]
+            if(Math.max(pr, pg, pb) - Math.min(pr, pg, pb) > CHROMA){
+                cr += pr
+                cg += pg
+                cb += pb
+                colored++
+            }
+            if(mask[i] === 1){
+                r += pr
+                g += pg
+                b += pb
+                count++
+            }
+        }
+    }
+    if(colored >= 12 && colored >= count * 0.15){
+        return [Math.round(cr / colored), Math.round(cg / colored), Math.round(cb / colored)]
+    }
+    return count < 8 ? null : [Math.round(r / count), Math.round(g / count), Math.round(b / count)]
+}
+
+/** The colours of a plate: the text keeps the colour of the original letters; the plate is made dark or light enough to read it. */
+function plateColors(base: [number, number, number], ink: [number, number, number]): { background: [number, number, number]; foreground: string } {
+    const baseLight = brightnessOf(base)
+    const inkLight = brightnessOf(ink)
+    let background = base
+    if(Math.abs(inkLight - baseLight) < INK_CONTRAST){
+        background = inkLight >= baseLight
+            ? [Math.round(base[0] * 0.25), Math.round(base[1] * 0.25), Math.round(base[2] * 0.25)]
+            : [Math.round(base[0] + (255 - base[0]) * 0.75), Math.round(base[1] + (255 - base[1]) * 0.75), Math.round(base[2] + (255 - base[2]) * 0.75)]
+    }
+    // Still too close (dark letters on a dark picture): black or white text instead
+    if(Math.abs(inkLight - brightnessOf(background)) < 70){
+        return { background, foreground: brightnessOf(background) > 150 ? '#111111' : '#ffffff' }
+    }
+    return { background, foreground: 'rgb(' + ink[0] + ', ' + ink[1] + ', ' + ink[2] + ')' }
 }
 
 /** The text pixels of a place as a coarse grid: how much of every cell is text (0..255). */
@@ -423,6 +500,35 @@ export default class ElementsEngine {
         }
         this._masks = masks
         this._scanSize = { width, height }
+
+        // The translations take the colour of the letters of the original (and follow it when it changes: the chosen line of a menu)
+        for(const element of this._elements){
+            if(element.state !== 'text' || element.segments.length === 0 || element.rect.w <= 0 || element.rect.h <= 0){
+                continue
+            }
+            const mask = masks[this._polarities.indexOf(element.polarity)]
+            if(mask === undefined){
+                continue
+            }
+            for(const segment of element.segments){
+                // The place of the segment in the picture that was looked at (the element knows both its places)
+                const box: Region = {
+                    x: element.scan.x + (segment.rect.x - element.rect.x) / element.rect.w * element.scan.w,
+                    y: element.scan.y + (segment.rect.y - element.rect.y) / element.rect.h * element.scan.h,
+                    w: segment.rect.w / element.rect.w * element.scan.w,
+                    h: segment.rect.h / element.rect.h * element.scan.h,
+                }
+                const color = inkColor(pixels, mask.mask, width, height, box)
+                if(color === null || (segment.ink !== undefined && Math.hypot(color[0] - segment.ink[0], color[1] - segment.ink[1], color[2] - segment.ink[2]) <= INK_CHANGED)){
+                    continue
+                }
+                segment.ink = color
+                segment.base = segment.base ?? segment.background
+                const colors = plateColors(segment.base, color)
+                segment.background = colors.background
+                segment.foreground = colors.foreground
+            }
+        }
 
         const now = Date.now()
         const manual = this._options.getManualRegions()
