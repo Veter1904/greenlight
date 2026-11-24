@@ -29,6 +29,9 @@ export interface ElementsOptions {
     onResults: (results: ElementResult[]) => void;
     onFrames?: (frames: AutoFrame[]) => void;
     onStatus?: (status: EngineStatus) => void;
+    // The part of the time the reader may work (0.25 = a quarter): after a reading the engine waits so that it does not take more.
+    // Without it (or 1) the reader works as long as there is something to read.
+    readDuty?: () => number;
 }
 
 export interface ElementResult {
@@ -768,6 +771,7 @@ export default class ElementsEngine {
             next = this._pick()
         }
 
+        const started = Date.now()
         if(next !== null){
             try {
                 await this._readElement(next)
@@ -778,7 +782,10 @@ export default class ElementsEngine {
         }
 
         if(this._running){
-            this._readTimer = setTimeout(() => this._readLoop(), next === null ? 120 : 0)
+            // The reader may take only a part of the time (the battery, the game): the longer a reading took, the longer the rest
+            const duty = this._options.readDuty?.() ?? 1
+            const rest = duty > 0 && duty < 1 ? Math.round((Date.now() - started) * (1 / duty - 1)) : 0
+            this._readTimer = setTimeout(() => this._readLoop(), next === null ? 120 : rest)
         }
     }
 
