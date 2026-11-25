@@ -223,22 +223,34 @@ export function splitJoinedWords(text: string): string {
 
 /** Are the models in a worker of their own (a detection then does not stop the engine from looking at the picture)? */
 export function ppocrRemote(): boolean {
-    return remote !== null && remoteReady
+    return remotes.some(worker => worker.ready && !worker.dead)
+}
+
+/** How many readers of that kind are there (two readings can go on at the same time, one in each). */
+export function ppocrRemoteCount(): number {
+    return remotes.filter(worker => worker.ready && !worker.dead).length
 }
 
 export function ppocrReady(): boolean {
-    return (det !== null && rec !== null) || remoteReady
+    return (det !== null && rec !== null) || ppocrRemote()
 }
 
-// ---- The reader in a worker of its own ----
+// ---- The reader in workers of their own ----
 // The models run in WebAssembly, in the thread that calls them: a reading of a paragraph keeps that thread busy for a second or two, and a worker that reads cannot look at the
-// picture meanwhile (a plate that is stale stays). So the models can live in a second worker: `serveReader` runs there, `useRemoteReader` connects the engine to it by a channel.
-let remote: MessagePort | null = null
-let remoteReady = false
+// picture meanwhile (a plate that is stale stays). So the models can live in other workers: `serveReader` runs there, `useRemoteReaders` connects the engine to them by channels.
+// With more than one reader two things are read at the same time (a new screen is read in half the time).
+interface RemoteWorker {
+    port: MessagePort;
+    ready: boolean;
+    dead: boolean;
+    // How many requests wait for an answer, and how many in a row did not get one
+    pending: number;
+    failures: number;
+}
+let remotes: RemoteWorker[] = []
 let remoteId = 0
-let remoteFailures = 0
 let remoteOnFailed: (() => void) | null = null
-const remoteWaiting = new Map<number, (answer: any) => void>()
+const remoteWaiting = new Map<number, { done: (answer: any) => void; worker: RemoteWorker }>()
 // The longest an answer may take (a reading is 1-3 s on the Deck, the models are loaded once)
 let REMOTE_TIMEOUT_MS = 20000
 const REMOTE_MAX_FAILURES = 3
@@ -248,78 +260,112 @@ export function setRemoteTimeout(ms: number): void {
     REMOTE_TIMEOUT_MS = ms
 }
 
-/** The engine side: the reader is in the worker at the other end of the port. `onReady` is called when it has its models, `onFailed` when it does not answer (the caller reads itself then). */
-export function useRemoteReader(port: MessagePort, onReady: () => void, onFailed: () => void): void {
-    remote = port
-    remoteReady = false
-    remoteFailures = 0
+/** The engine side: the readers are in the workers at the other end of the ports. `onReady` is called when the first one has its models, `onFailed` when none is left (the caller reads itself then). */
+export function useRemoteReaders(ports: MessagePort[], onReady: () => void, onFailed: () => void): void {
     remoteOnFailed = onFailed
-    port.onmessage = (event: MessageEvent) => {
-        const answer = event.data
-        if(answer.type === 'ready'){
-            remoteReady = true
-            onReady()
-        } else if(answer.type === 'failed'){
-            giveUpRemote()
-        } else if(answer.id !== undefined){
-            const done = remoteWaiting.get(answer.id)
-            if(done !== undefined){
-                remoteWaiting.delete(answer.id)
-                done(answer)
+    let announced = false
+    remotes = ports.map((port) => {
+        const worker: RemoteWorker = { port, ready: false, dead: false, pending: 0, failures: 0 }
+        port.onmessage = (event: MessageEvent) => {
+            const answer = event.data
+            if(answer.type === 'ready'){
+                worker.ready = true
+                if(!announced){
+                    announced = true
+                    onReady()
+                }
+            } else if(answer.type === 'failed'){
+                buryRemote(worker)
+            } else if(answer.id !== undefined){
+                const waiting = remoteWaiting.get(answer.id)
+                if(waiting !== undefined){
+                    remoteWaiting.delete(answer.id)
+                    waiting.worker.pending--
+                    waiting.done(answer)
+                }
             }
         }
+        return worker
+    })
+}
+
+/** One reader: the old way of putting it. */
+export function useRemoteReader(port: MessagePort, onReady: () => void, onFailed: () => void): void {
+    useRemoteReaders([port], onReady, onFailed)
+}
+
+/** The readers of the other workers are given up (they did not come up in time): `onFailed` is called, and the caller reads itself. */
+export function abandonRemoteReader(): void {
+    for(const worker of remotes){
+        buryRemote(worker)
     }
 }
 
-/** The reader of the other worker is given up (it did not come up in time): `onFailed` is called, and the caller reads itself. */
-export function abandonRemoteReader(): void {
-    giveUpRemote()
-}
-
-function giveUpRemote(): void {
-    if(remote === null){
+/** A reader that does not answer or did not start is not asked any more; when none is left, the caller is told. */
+function buryRemote(worker: RemoteWorker): void {
+    if(worker.dead){
         return
     }
-    remoteReady = false
-    remote = null
-    for(const done of Array.from(remoteWaiting.values())){
-        done(null)
+    worker.dead = true
+    worker.ready = false
+    for(const [id, waiting] of Array.from(remoteWaiting.entries())){
+        if(waiting.worker === worker){
+            remoteWaiting.delete(id)
+            waiting.done(null)
+        }
     }
-    remoteWaiting.clear()
-    const callback = remoteOnFailed
-    remoteOnFailed = null
-    callback?.()
+    if(remotes.length > 0 && remotes.every(other => other.dead)){
+        const callback = remoteOnFailed
+        remoteOnFailed = null
+        remotes = []
+        callback?.()
+    }
 }
 
 function askRemote(message: any, transfer: Transferable[]): Promise<any | null> {
-    const port = remote
-    if(port === null || !remoteReady){
+    // The reader that has the fewest requests waiting
+    let worker: RemoteWorker | null = null
+    for(const other of remotes){
+        if(other.ready && !other.dead && (worker === null || other.pending < worker.pending)){
+            worker = other
+        }
+    }
+    if(worker === null){
         return Promise.resolve(null)
     }
+    const chosen = worker
     remoteStats.calls++
+    chosen.pending++
     return new Promise((resolve) => {
         const id = ++remoteId
         const timer = setTimeout(() => {
-            remoteWaiting.delete(id)
+            if(remoteWaiting.delete(id)){
+                chosen.pending--
+            }
             remoteStats.failures++
-            remoteFailures++
-            if(remoteFailures >= REMOTE_MAX_FAILURES){
-                giveUpRemote()
+            chosen.failures++
+            if(chosen.failures >= REMOTE_MAX_FAILURES){
+                buryRemote(chosen)
             }
             resolve(null)
         }, REMOTE_TIMEOUT_MS)
-        remoteWaiting.set(id, (answer: any) => {
-            clearTimeout(timer)
-            if(answer !== null && answer.error === undefined){
-                remoteFailures = 0
-            }
-            resolve(answer !== null && answer.error === undefined ? answer : null)
+        remoteWaiting.set(id, {
+            worker: chosen,
+            done: (answer: any) => {
+                clearTimeout(timer)
+                if(answer !== null && answer.error === undefined){
+                    chosen.failures = 0
+                }
+                resolve(answer !== null && answer.error === undefined ? answer : null)
+            },
         })
         try {
-            port.postMessage({ ...message, id }, transfer)
+            chosen.port.postMessage({ ...message, id }, transfer)
         } catch(error) {
             clearTimeout(timer)
-            remoteWaiting.delete(id)
+            if(remoteWaiting.delete(id)){
+                chosen.pending--
+            }
             resolve(null)
         }
     })
@@ -496,7 +542,7 @@ export async function ppocrDetectBoxes(rgba: Uint8ClampedArray, width: number, h
         return []
     }
     const started = Date.now()
-    if(remote !== null){
+    if(ppocrRemote()){
         // The picture is copied (the engine keeps using its own) and given to the other worker
         const copy = rgba.slice()
         const answer = await askRemote({ op: 'detect', w: width, h: height, buf: copy.buffer }, [copy.buffer])
@@ -522,7 +568,7 @@ export async function ppocrRecognize(canvas: any): Promise<OcrResult> {
         return { text: '', confidence: 0, lines: [] }
     }
     const rgba: Uint8ClampedArray = context.getImageData(0, 0, width, height).data
-    if(remote !== null){
+    if(ppocrRemote()){
         const answer = await askRemote({ op: 'read', w: width, h: height, buf: rgba.buffer }, [rgba.buffer])
         if(answer === null){
             return { text: '', confidence: 0, lines: [] }

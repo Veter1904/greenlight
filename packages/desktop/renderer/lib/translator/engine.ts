@@ -31,6 +31,12 @@ export interface TranslatorConfig {
     tiles?: Region[];
 }
 
+// How much a picture is enlarged before the modern reader reads it (1: not at all)
+const COLOR_READ_SCALE = 1
+
+/** Where the time of the readings goes (for the performance report and the tests): preparing the picture, reading it, the number of readings. */
+export const readTimes = { prepare: 0, recognize: 0, reads: 0, draw: 0, pixels: 0, ink: 0, rest: 0 }
+
 /** One piece of text of the interface (a line, or a few lines that belong together) with its translation. */
 export interface TranslatedSegment {
     original: string;
@@ -1922,7 +1928,9 @@ export default class TranslatorEngine {
     /** Reads the window with one text colour and turns the result into pieces of text with their position and colours. */
     async _read(job: Snapshot, polarity: Polarity, raw: boolean | 'stretched' | 'color' = false): Promise<ReadResult | null> {
         const source = job.source
+        const preparing = Date.now()
         const prepared = await this._prepareForReading(job.canvas, source, polarity, raw)
+        readTimes.prepare += Date.now() - preparing
         if(prepared === null){
             return null
         }
@@ -1938,7 +1946,10 @@ export default class TranslatorEngine {
             }
         }
 
+        const recognizing = Date.now()
         const result = await recognizeCanvas(prepared.canvas, job.config.source, this._options.priority ?? 1, job.config.mode === 'task' ? TASK_WORD_GAP : DIALOG_WORD_GAP, job.config.fullScreen === true ? 'page' : 'block', raw === 'color')
+        readTimes.recognize += Date.now() - recognizing
+        readTimes.reads++
         if(result.confidence < MIN_CONFIDENCE){
             return null
         }
@@ -1950,6 +1961,10 @@ export default class TranslatorEngine {
             if(text !== ''){
                 lines.push({ line, text })
             }
+        }
+
+        if(lines.length > 0 && prepared.lazyInk !== undefined && prepared.ink.length === 0){
+            prepared.ink = await prepared.lazyInk()
         }
 
         // Lines that continue the same sentence (a subtitle that wraps) are translated together, other lines on their own
@@ -2140,6 +2155,11 @@ export default class TranslatorEngine {
         if(source.sh <= SINGLE_ROW_MAX && source.sw >= source.sh * 2){
             scale = Math.min(scale, Math.max(1.2, SINGLE_ROW_TARGET / source.sh))
         }
+        // The modern reader looks at the natural picture and does not need it enlarged (its detector finds small text at the size it has, and it shrinks every line to its own height):
+        // preparing and reading a picture 4-9 times smaller is much faster
+        if(raw === 'color'){
+            scale = (globalThis as any).DLT_COLOR_SCALE ?? COLOR_READ_SCALE
+        }
         // A big window (the whole screen) is not enlarged as much: the time of the reader grows with the number of pixels
         if(source.sw * source.sh * scale * scale > MAX_OCR_PIXELS){
             scale = Math.max(1, Math.sqrt(MAX_OCR_PIXELS / (source.sw * source.sh)))
@@ -2156,24 +2176,33 @@ export default class TranslatorEngine {
             return null
         }
 
+        const t0 = Date.now()
         workContext.drawImage(frame, 0, 0, frame.width, frame.height, 0, 0, width, height)
         // The picture is prepared in several short pieces, not one long one: the page draws the game and reads the pad in between
         await breathe()
         const image = workContext.getImageData(0, 0, width, height)
         const data = image.data
+        readTimes.draw += Date.now() - t0
 
         // Keep the original colours (to find the colour of the interface behind the text) before the picture is turned black and white
+        const t1 = Date.now()
         const colors = new Uint8ClampedArray(data)
         await breathe()
+        readTimes.pixels += Date.now() - t1
         // Big letters have thick strokes: the window the pixels are compared with must be wider than a stroke, or only the edges are marked
         const strokeRadius = Math.min(48, Math.round(source.sh * scale * READ_RADIUS))
-        const ink = (await inkMasksInSlices(data, width, height, [polarity], breathe, 5, strokeRadius))[0].mask
-        await breathe()
+        const pixelCount = width * height
+        const t2 = Date.now()
+        // The mask of the letters is only needed to turn the picture into black and white, and (after the reading) to measure the height of the letters and the colour behind them: the other
+        // ways of reading (the natural picture, in grey) work it out only for a reading that is kept; most readings of a place that is not text never need it
+        const inkOf = async (): Promise<Uint8Array> => (await inkMasksInSlices(colors, width, height, [polarity], breathe, 5, strokeRadius))[0].mask
+        const ink = raw === false ? (await inkMasksInSlices(data, width, height, [polarity], breathe, 5, strokeRadius))[0].mask : new Uint8Array(0)
+        readTimes.ink += Date.now() - t2
 
         if(raw === true){
             // The picture as it is, in grey with more contrast: thin or faint letters (a menu in a pale colour) are lost when the
             // picture is cut into black and white, and the reader does better on the grey one
-            for(let i = 0; i < ink.length; i++){
+            for(let i = 0; i < pixelCount; i++){
                 const grey = (data[i * 4] * 299 + data[i * 4 + 1] * 587 + data[i * 4 + 2] * 114) / 1000
                 const value = Math.max(0, Math.min(255, (grey - 30) * 1.9))
                 data[i * 4] = value
@@ -2183,15 +2212,15 @@ export default class TranslatorEngine {
             }
         } else if(raw === 'color'){
             // The picture as it is, in its colours (the reader of the modern kind, PP-OCR, does best on the natural picture)
-            for(let i = 0; i < ink.length; i++){
+            for(let i = 0; i < pixelCount; i++){
                 data[i * 4 + 3] = 255
             }
         } else if(raw === 'stretched'){
             // The contrast is stretched between the darkest and the brightest pixels of the place, and light letters are turned
             // into dark ones on a light ground (the reader is far better at those than at light letters on a dark ground)
             const histogram = new Uint32Array(256)
-            const greys = new Uint8Array(ink.length)
-            for(let i = 0; i < ink.length; i++){
+            const greys = new Uint8Array(pixelCount)
+            for(let i = 0; i < pixelCount; i++){
                 const grey = Math.round((data[i * 4] * 299 + data[i * 4 + 1] * 587 + data[i * 4 + 2] * 114) / 1000)
                 greys[i] = grey
                 histogram[grey]++
@@ -2200,7 +2229,7 @@ export default class TranslatorEngine {
                 let sum = 0
                 for(let level = 0; level < 256; level++){
                     sum += histogram[level]
-                    if(sum >= share * ink.length){
+                    if(sum >= share * pixelCount){
                         return level
                     }
                 }
@@ -2212,13 +2241,13 @@ export default class TranslatorEngine {
             // Which are the letters, the bright pixels or the dark ones? The kind that is fewer (letters are the smaller part of a place);
             // the polarity the scout guessed may be wrong (a pale text inside a dark frame)
             let bright = 0
-            for(let i = 0; i < ink.length; i++){
+            for(let i = 0; i < pixelCount; i++){
                 if((greys[i] - low) * scale >= 128){
                     bright++
                 }
             }
-            const lightLetters = bright < ink.length * 0.5
-            for(let i = 0; i < ink.length; i++){
+            const lightLetters = bright < pixelCount * 0.5
+            for(let i = 0; i < pixelCount; i++){
                 let value = Math.max(0, Math.min(255, (greys[i] - low) * scale))
                 if(lightLetters){
                     value = 255 - value
@@ -2229,7 +2258,7 @@ export default class TranslatorEngine {
                 data[i * 4 + 3] = 255
             }
         } else {
-            for(let i = 0; i < ink.length; i++){
+            for(let i = 0; i < pixelCount; i++){
                 const value = ink[i] === 1 ? 0 : 255
                 data[i * 4] = value
                 data[i * 4 + 1] = value
@@ -2260,6 +2289,7 @@ export default class TranslatorEngine {
             scaleY: height / source.sh,
             colors,
             ink,
+            lazyInk: raw === false ? undefined : inkOf,
         }
     }
 }
@@ -2274,4 +2304,6 @@ interface PreparedImage {
     scaleY: number;
     colors: Uint8ClampedArray;
     ink: Uint8Array;
+    // Works the mask of the letters out when it was left for later (an empty `ink`)
+    lazyInk?: () => Promise<Uint8Array>;
 }

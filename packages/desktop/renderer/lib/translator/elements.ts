@@ -1,6 +1,6 @@
 import TranslatorEngine, { EngineStatus, Polarity, TextColor, TranslatedSegment, TranslateFunction, TranslatorResult, isSameReading, normalizeText, templateKey, toTranslatable } from './engine'
 import { getReaderMode } from './ocr'
-import { ppocrDetectBoxes, ppocrReady, ppocrRemote } from './ppocr'
+import { ppocrDetectBoxes, ppocrReady, ppocrRemote, ppocrRemoteCount } from './ppocr'
 import { Region, FitMode, regionToSource, videoRectToScreen } from './geometry'
 import { getOcrWorker } from './ocr'
 import { BlockRole, analyseScreen, classify } from './scout'
@@ -39,6 +39,8 @@ export interface ElementsOptions {
     // How fast the engine reacts: 1 = as it was made for a video (a look every 0.7 s, a shown text read again after 1.8 s); less is faster
     // (0.5 = twice as fast). A device that sends only a few pictures a second, and wants new text on screen quickly, asks for less.
     speed?: () => number;
+    // How many readings may go on at the same time (1 when this is not given): the readers that are in workers of their own can read two places at once
+    readConcurrency?: () => number;
 }
 
 export interface ElementResult {
@@ -629,7 +631,7 @@ export default class ElementsEngine {
     _detectThumb: Uint8Array | null = null
     _lookChanged = false
     _lastWake = 0
-    _readTimer: ReturnType<typeof setTimeout> | undefined
+    _readTimers: Array<ReturnType<typeof setTimeout> | undefined> = []
     _elements: Element[] = []
     _nextId = 1
     _canvas = document.createElement('canvas')
@@ -852,7 +854,7 @@ export default class ElementsEngine {
 
         this._timer = setTimeout(() => this._scan(), 300)
         this._watchTimer = setTimeout(() => this._watch(), 600)
-        this._readTimer = setTimeout(() => this._readLoop(), 500)
+        this._readTimers = [setTimeout(() => this._readLoop(0), 500), setTimeout(() => this._readLoop(1), 700)]
     }
 
     stop() {
@@ -862,10 +864,10 @@ export default class ElementsEngine {
             this._timer = undefined
         }
         clearTimeout(this._watchTimer)
-        if(this._readTimer !== undefined){
-            clearTimeout(this._readTimer)
-            this._readTimer = undefined
+        for(const timer of this._readTimers){
+            clearTimeout(timer)
         }
+        this._readTimers = []
         this._dropWorker()
         this._pendingLooks.clear()
         this._elements = []
@@ -1582,6 +1584,10 @@ export default class ElementsEngine {
 
     /** On how many looks in a row an element has to be found before it is read (a subtitle at once, the rest of the interface a little later). */
     _need(element: Element): number {
+        // A line that the neural detector found is a line of text already (the scout's pieces are often false alarms and have to be seen again and again): one more look is enough
+        if(element.detected === true && (globalThis as any).DLT_OLDNEED !== true){
+            return (element.role === 'subtitle' ? 1 : 2) + Math.floor(this._elements.length / 14)
+        }
         let need = element.role === 'subtitle' ? 1 : (element.plate || element.role === 'notice' ? 2 : 3)
         if(centralness(element.rect) > 0){
             need = Math.min(need, 2)
@@ -1597,8 +1603,14 @@ export default class ElementsEngine {
 
     // ----------------------------------------------------------------------------------------------- reading
 
-    async _readLoop() {
+    async _readLoop(slot = 0) {
         if(!this._running){
+            return
+        }
+
+        // The second loop works only when two readings may go on at the same time (and there are two readers to do them)
+        if(slot > 0 && slot >= Math.min(this._options.readConcurrency?.() ?? 1, Math.max(1, ppocrRemoteCount()))){
+            this._readTimers[slot] = setTimeout(() => this._readLoop(slot), 300)
             return
         }
 
@@ -1621,7 +1633,7 @@ export default class ElementsEngine {
             // The reader may take only a part of the time (the battery, the game): the longer a reading took, the longer the rest
             const duty = this._options.readDuty?.() ?? 1
             const rest = duty > 0 && duty < 1 ? Math.round((Date.now() - started) * (1 / duty - 1)) : 0
-            this._readTimer = setTimeout(() => this._readLoop(), next === null ? 120 : rest)
+            this._readTimers[slot] = setTimeout(() => this._readLoop(slot), next === null ? 120 : rest)
         }
     }
 
@@ -1711,7 +1723,9 @@ export default class ElementsEngine {
                 attempts.push([element.polarity, false])
             }
         }
-        if(element.score >= RAW_MIN_SCORE){
+        // The ways of the classic reader that are tried when nothing is read (they take a second or more each) are for a place the scout found: a line that the neural detector found
+        // and the modern reader cannot read is an icon or an ornament, and trying three more ways on every such place keeps the real text waiting
+        if(element.score >= RAW_MIN_SCORE && !(element.detected === true && getReaderMode() !== 'tesseract' && ppocrReady() && (globalThis as any).DLT_OLDATTEMPTS !== true)){
             attempts.push([element.polarity, true], [element.polarity, 'stretched'])
         }
         let result: Awaited<ReturnType<TranslatorEngine['_read']>> = null
