@@ -165,6 +165,8 @@ interface Element {
     dirty: boolean;
     // A small grey fingerprint of the place of the text while it is shown (the watch between the looks), and the reading it belongs to
     detected?: boolean;
+    // The pixels of the text changed much since it was read: a reading that finds nothing now takes the plate away at once
+    strongChange?: boolean;
     watchSig?: Uint8Array;
     // The signature of the last look and whether the text changed since the look before (typing); since when it has not settled
     lastCells?: Uint8Array;
@@ -361,6 +363,26 @@ function cellsDifference(a: Uint8Array, b: Uint8Array): number {
         union += Math.max(a[i], b[i])
     }
     return union === 0 ? 0 : different / union
+}
+
+/**
+ * How different two signatures are, looking only at the cells that hold much ink in one of them: the letters. A text on a transparent background (a
+ * moving picture behind it) gets ink in many cells by chance, which is not a change of the text; the cells of the strokes are what counts.
+ */
+const STRONG_CELL = 110
+function coreDifference(a: Uint8Array, b: Uint8Array): number {
+    if(a.length !== b.length){
+        return 1
+    }
+    let different = 0
+    let union = 0
+    for(let i = 0; i < a.length; i++){
+        if(Math.max(a[i], b[i]) >= STRONG_CELL){
+            different += Math.abs(a[i] - b[i])
+            union += Math.max(a[i], b[i])
+        }
+    }
+    return union === 0 ? cellsDifference(a, b) : different / union
 }
 
 export default class ElementsEngine {
@@ -911,7 +933,7 @@ export default class ElementsEngine {
                     const mask = this._masks[this._polarities.indexOf(element.polarity)]
                     if(mask !== undefined){
                         const current = cellsOf(mask.mask, width, height, element.scan)
-                        if(current.sum < element.sigSum * 0.5 || cellsDifference(element.sig, current.cells) > 0.7){
+                        if(current.sum < element.sigSum * 0.5 || coreDifference(element.sig, current.cells) > 0.7){
                             element.segments = []
                             element.state = 'idle'
                         }
@@ -951,7 +973,7 @@ export default class ElementsEngine {
                 continue
             }
             const current = cellsOf(mask.mask, width, height, element.scan, element.sigGrid)
-            const difference = cellsDifference(element.sig, current.cells)
+            const difference = coreDifference(element.sig, current.cells)
             result.checked++
             result.differences.push(Math.round(difference * 100) / 100)
             if(difference > VERIFY_CHANGED || current.sum < element.sigSum * 0.35){
@@ -1059,7 +1081,7 @@ export default class ElementsEngine {
         const current = cellsOf(mask.mask, this._scanSize.width, this._scanSize.height, scan)
 
         // Is the text still changing (typed letter by letter)?
-        const moved = element.lastCells !== undefined && cellsDifference(element.lastCells, current.cells) > STILL_DIFF
+        const moved = element.lastCells !== undefined && coreDifference(element.lastCells, current.cells) > STILL_DIFF
         element.lastCells = current.cells
         if(moved){
             if(element.changing !== true){
@@ -1081,7 +1103,7 @@ export default class ElementsEngine {
             return
         }
 
-        const difference = cellsDifference(element.sig, current.cells)
+        const difference = coreDifference(element.sig, current.cells)
 
         if(element.state === 'dead'){
             if((now >= element.deadUntil || difference > REVIVE_CHANGE) && !element.dirty){
@@ -1100,10 +1122,11 @@ export default class ElementsEngine {
             return
         }
 
-        // Most of the text pixels are others than what was read: the translation does not belong here any more
+        // Most of the text pixels are others than what was read: the place is read at once, and the plate stays until the reading says what is there now (a button
+        // that is highlighted changes its look, not its text: its plate must not blink). A reading that finds nothing takes the plate away.
         if(difference > HIDE_CHANGED && element.segments.length > 0){
-            element.segments = []
-            element.state = 'idle'
+            element.strongChange = true
+            element.readAt = 0
         }
 
         // The text is back after it had gone (or the text pixels changed): the element is read again
@@ -1207,6 +1230,8 @@ export default class ElementsEngine {
         element.dirty = false
         element.reading = true
         element.readAt = Date.now()
+        const strong = element.strongChange === true
+        element.strongChange = false
 
         const crop = document.createElement('canvas')
         crop.width = Math.max(8, Math.round(source.sw))
@@ -1271,7 +1296,7 @@ export default class ElementsEngine {
         // The text changed while it was being read (it was typed on): what was read is a part of it, and it is not shown. The next
         // reading is called at once (the gap between two readings does not apply).
         if(current !== null && element.lastCells !== undefined && Date.now() - (element.changingSince ?? Date.now()) < SETTLE_LIMIT_MS
-            && (element.lastCells.length !== current.cells.length || cellsDifference(current.cells, element.lastCells) > STILL_DIFF * 1.5)){
+            && (element.lastCells.length !== current.cells.length || coreDifference(current.cells, element.lastCells) > STILL_DIFF * 1.5)){
             element.dirty = true
             element.dirtySince = Date.now()
             element.readAt = 0
@@ -1302,6 +1327,14 @@ export default class ElementsEngine {
             if(letters <= SHORT_TEXT_LETTERS){
                 result = null
             }
+        }
+
+        if((result === null || result.segments.length === 0) && strong && element.segments.length > 0){
+            // The text changed much and nothing can be read there now: the old translation does not belong here
+            element.segments = []
+            element.state = 'idle'
+            this._emit()
+            return
         }
 
         if(result === null || result.segments.length === 0){
