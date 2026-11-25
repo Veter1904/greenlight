@@ -767,6 +767,8 @@ function breathe(): Promise<void> {
 
 // A single row of text: up to this tall (pixels of the picture) it is enlarged so that its height is about SINGLE_ROW_TARGET
 const SINGLE_ROW_MAX = 110
+// The comparison window of the reading picture is at least this part of the height of the place (a row of letters)
+const READ_RADIUS = 0.2
 const SINGLE_ROW_TARGET = 64
 
 export default class TranslatorEngine {
@@ -2124,7 +2126,9 @@ export default class TranslatorEngine {
         // Keep the original colours (to find the colour of the interface behind the text) before the picture is turned black and white
         const colors = new Uint8ClampedArray(data)
         await breathe()
-        const ink = (await inkMasksInSlices(data, width, height, [polarity], breathe))[0].mask
+        // Big letters have thick strokes: the window the pixels are compared with must be wider than a stroke, or only the edges are marked
+        const strokeRadius = Math.min(48, Math.round(source.sh * scale * READ_RADIUS))
+        const ink = (await inkMasksInSlices(data, width, height, [polarity], breathe, 5, strokeRadius))[0].mask
         await breathe()
 
         if(raw === true){
@@ -2161,9 +2165,18 @@ export default class TranslatorEngine {
             const low = percentile(0.02)
             const high = percentile(0.98)
             const scale = 255 / Math.max(40, high - low)
+            // Which are the letters, the bright pixels or the dark ones? The kind that is fewer (letters are the smaller part of a place);
+            // the polarity the scout guessed may be wrong (a pale text inside a dark frame)
+            let bright = 0
+            for(let i = 0; i < ink.length; i++){
+                if((greys[i] - low) * scale >= 128){
+                    bright++
+                }
+            }
+            const lightLetters = bright < ink.length * 0.5
             for(let i = 0; i < ink.length; i++){
                 let value = Math.max(0, Math.min(255, (greys[i] - low) * scale))
-                if(polarity === 'light'){
+                if(lightLetters){
                     value = 255 - value
                 }
                 data[i * 4] = value
