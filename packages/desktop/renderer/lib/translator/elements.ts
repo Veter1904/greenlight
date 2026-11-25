@@ -5,6 +5,7 @@ import { Region, FitMode, regionToSource, videoRectToScreen } from './geometry'
 import { getOcrWorker } from './ocr'
 import { BlockRole, analyseScreen, classify } from './scout'
 import { inkMasksInSlices } from './ink'
+import { glossaryTranslation } from './uiwords'
 import type { AutoFrame } from './autowindows'
 
 /**
@@ -1211,6 +1212,15 @@ export default class ElementsEngine {
             element.sig = current.cells
             element.sigSum = current.sum
             element.sigGrid = { gx: current.gx, gy: current.gy }
+        }
+
+        // A place that only the detector found (a picture, a rock, a pattern that looks like letters) must give a real text: a short word is believed
+        // only when it is a word of the interface of a game ("Play", "Back")
+        if(result !== null && element.detected === true){
+            const letters = result.segments.reduce((sum, segment) => sum + (segment.text.match(LETTER) || []).length, 0)
+            if(letters < 5 && glossaryTranslation(result.segments.map(segment => segment.text).join(' '), this._options.getSettings().source, 'uk') === null){
+                result = null
+            }
         }
 
         // A few letters that the reader is not sure about are the pattern of an icon (a button of the pad, a symbol), not a word

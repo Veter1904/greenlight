@@ -81,6 +81,27 @@ function splitWords(letters: string): number[] | null {
     return cuts.length > 0 ? cuts : null
 }
 
+/** How much of a reading is made of real words (0..1): a reader that mistakes letters of a pixel font reads "Obtoined o Life Copsule". Without the word list: 1. */
+function plausibility(text: string): number {
+    if(wordCost === null){
+        return 1
+    }
+    let words = 0
+    let known = 0
+    for(const token of text.split(/[^A-Za-z']+/)){
+        if(token.length < 2){
+            continue
+        }
+        words++
+        // names and rare words are not in the list: a word counts when it, or its form without a plural/'s, is known
+        const lower = token.toLowerCase().replace(/'s$/, '')
+        if(wordCost.has(lower) || wordCost.has(lower.replace(/s$/, '')) || wordCost.has(lower.replace(/(ed|ing)$/, ''))){
+            known++
+        }
+    }
+    return words === 0 ? 1 : known / words
+}
+
 function splitJoinedWords(text: string): string {
     if(wordCost === null){
         return text
@@ -224,7 +245,6 @@ async function recognizeBox(rgba: Uint8ClampedArray, width: number, height: numb
     let last = 0
     let sum = 0
     let count = 0
-    // Where (at which step) each letter was seen: a stylized font makes the recognizer drop the spaces, but the gaps are still there
     const letters: Array<{ at: number; text: string }> = []
     for(let t = 0; t < steps; t++){
         let best = 0
@@ -243,22 +263,12 @@ async function recognizeBox(rgba: Uint8ClampedArray, width: number, height: numb
         }
         last = best
     }
-    // Spaces the recognizer put are kept; where it put none and a gap is much wider than the usual one between letters, a space is added
-    const gaps: number[] = []
-    for(let i = 1; i < letters.length; i++){
-        if(letters[i].text !== ' ' && letters[i - 1].text !== ' '){
-            gaps.push(letters[i].at - letters[i - 1].at)
-        }
+    for(const letter of letters){
+        text += letter.text
     }
-    const sorted = gaps.slice().sort((a, b) => a - b)
-    const usual = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : 0
-    for(let i = 0; i < letters.length; i++){
-        if(i > 0 && letters.length >= 6 && letters[i].text !== ' ' && letters[i - 1].text !== ' ' && letters[i].at - letters[i - 1].at >= Math.max(4, usual * 2.2)){
-            text += ' '
-        }
-        text += letters[i].text
-    }
-    return { text: splitJoinedWords(text), confidence: count > 0 ? 100 * sum / count : 0 }
+    const joined = splitJoinedWords(text)
+    // A reading that is mostly not words is less sure than the recognizer thinks (the other reader may do better)
+    return { text: joined, confidence: count > 0 ? (100 * sum / count) * (0.35 + 0.65 * plausibility(joined)) : 0 }
 }
 
 /** Where the text is: the boxes (pixels of the picture) of the lines of text the detector finds. */
