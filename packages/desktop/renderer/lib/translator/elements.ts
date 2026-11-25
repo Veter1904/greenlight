@@ -110,6 +110,22 @@ const READ_GAP_MS = 600
 const SHOWN_READ_GAP_MS = 1800
 // A shift of the place smaller than this is not followed (the picture is looked at coarsely and the place shakes a little)
 const MOVE_TOLERANCE = 0.006
+
+// A text that scrolls: a piece of text that was not found where an element was, but looks just like that element (the pixels of the letters are the
+// same) somewhere not far from it, is that element: it has moved. Its translation goes with it and nothing is read again.
+// ... the coarse look at the letters must say they are alike (this only picks the candidates), then the text pixels themselves must lie on each other
+const SCROLL_COARSE = 0.42
+const SCROLL_PATCH = 0.5
+// ... how far it may have gone (fractions of the screen)
+const SCROLL_MAX_DX = 0.04
+const SCROLL_MAX_DY = 0.4
+// The place of an element whose pixels differ more than this from the text it was read with is looked at for another element that matches better
+const PLACE_MISMATCH = 0.45
+// Elements that left the screen are remembered (with their translations) so that a text that scrolls back is shown at once
+const PARKED_MAX = 80
+const PARKED_MAX_AGE_MS = 120000
+// How many texts were followed when they scrolled, were put back from the memory, and were put into it (for tests)
+export const scrollStats = { moved: 0, restored: 0, parked: 0, scores: [] as number[] }
 // A translation that has got a better version is replaced only while it is young
 const BETTER_MS = 4000
 // Pieces of text that are at least this tall (fractions of the screen) and not further apart than this many heights are one title
@@ -186,6 +202,8 @@ interface Element {
     sig: Uint8Array | null;
     sigSum: number;
     sigGrid?: { gx: number; gy: number };
+    // The text pixels as they were when it was read (to know the text again when it has moved)
+    sigPatch?: Patch;
     segments: Segment[];
 }
 
@@ -350,6 +368,64 @@ function plateColors(base: [number, number, number], ink: [number, number, numbe
     return { background, foreground: 'rgb(' + ink[0] + ', ' + ink[1] + ', ' + ink[2] + ')' }
 }
 
+/** The text pixels of a place as they are: where the letters are (positions in the box, row by row). */
+interface Patch {
+    w: number;
+    h: number;
+    ink: Int32Array;
+}
+
+function patchOf(mask: Uint8Array, width: number, height: number, box: Region): Patch | null {
+    const x0 = Math.max(0, Math.floor(box.x * width))
+    const y0 = Math.max(0, Math.floor(box.y * height))
+    const x1 = Math.min(width, Math.ceil((box.x + box.w) * width))
+    const y1 = Math.min(height, Math.ceil((box.y + box.h) * height))
+    if(x1 <= x0 || y1 <= y0 || (x1 - x0) * (y1 - y0) > 400000){
+        return null
+    }
+    const w = x1 - x0
+    const list: number[] = []
+    for(let y = y0; y < y1; y++){
+        for(let x = x0; x < x1; x++){
+            if(mask[y * width + x] === 1){
+                list.push((y - y0) * w + (x - x0))
+            }
+        }
+    }
+    return list.length < 20 ? null : { w, h: y1 - y0, ink: Int32Array.from(list) }
+}
+
+/** How well the letters of a patch lie on the letters at a place now (0..1: the same text, a few pixels off, is about 0.7 and more; another text 0.3 and less). */
+function patchMatch(patch: Patch, mask: Uint8Array, width: number, height: number, box: Region): number {
+    const x0 = Math.floor(box.x * width)
+    const y0 = Math.floor(box.y * height)
+    const x1 = Math.min(width, Math.ceil((box.x + box.w) * width))
+    const y1 = Math.min(height, Math.ceil((box.y + box.h) * height))
+    let there = 0
+    for(let y = Math.max(0, y0); y < y1; y++){
+        for(let x = Math.max(0, x0); x < x1; x++){
+            if(mask[y * width + x] === 1){
+                there++
+            }
+        }
+    }
+    let best = 0
+    for(let dy = -2; dy <= 2; dy++){
+        for(let dx = -3; dx <= 3; dx++){
+            let hits = 0
+            for(let i = 0; i < patch.ink.length; i++){
+                const x = x0 + dx + (patch.ink[i] % patch.w)
+                const y = y0 + dy + Math.floor(patch.ink[i] / patch.w)
+                if(x >= 0 && x < width && y >= 0 && y < height && mask[y * width + x] === 1){
+                    hits++
+                }
+            }
+            best = Math.max(best, 2 * hits / (patch.ink.length + there))
+        }
+    }
+    return best
+}
+
 /** The text pixels of a place as a coarse grid: how much of every cell is text (0..255). */
 function cellsOf(mask: Uint8Array, width: number, height: number, box: Region, grid?: { gx: number; gy: number }): Cells {
     const x0 = Math.max(0, Math.floor(box.x * width))
@@ -446,6 +522,8 @@ export default class ElementsEngine {
     // The tools of the text reader and the translations that were made
     _toolbox: TranslatorEngine
     _cache: Map<string, string> = new Map()
+    // Elements that have gone out of sight (scrolled away) with what was read: they come back when their text does
+    _parked: Array<{ element: Element; at: number }> = []
     _pending: Map<string, Promise<string>> = new Map()
     _lastKey = ''
     // The worker that does the analysis of the picture (null: it is done here), and the looks that wait for it
@@ -675,6 +753,7 @@ export default class ElementsEngine {
         this._options.onResults([])
         this._options.onFrames?.([])
         this._cache.clear()
+        this._parked = []
         this._pending.clear()
     }
 
@@ -969,6 +1048,13 @@ export default class ElementsEngine {
                 }
             }
 
+            // A text that scrolled: the place says it is another element (or none), the pixels of the letters say whose text it is
+            const scrolled = this._scrolled(best, block.polarity, scan, rect, taken)
+            if(scrolled !== null){
+                this._relocate(scrolled, rect, scan)
+                best = scrolled
+            }
+
             if(best === null){
                 if(this._elements.length >= MAX_ELEMENTS){
                     continue
@@ -997,6 +1083,7 @@ export default class ElementsEngine {
                     if(mask !== undefined){
                         const current = cellsOf(mask.mask, width, height, element.scan)
                         if(current.sum < element.sigSum * 0.5 || coreDifference(element.sig, current.cells) > 0.7){
+                            this._park(element)
                             element.segments = []
                             element.state = 'idle'
                         }
@@ -1005,9 +1092,110 @@ export default class ElementsEngine {
             }
         }
         this._elements = this._elements.filter(element => element.missed < (element.state === 'dead' ? DEAD_DROP_MISSES : DROP_MISSES) || element.reading)
+        this._parked = this._parked.filter(entry => now - entry.at < PARKED_MAX_AGE_MS)
 
         this._emit()
         this._report()
+    }
+
+    /** An element that has gone out of sight is remembered with its translation (a text that scrolls away and back is not read again). */
+    _park(element: Element) {
+        if(element.state !== 'text' || element.sig === null || element.sigGrid === undefined || element.segments.length === 0){
+            return
+        }
+        this._parked = this._parked.filter(entry => entry.element.id !== element.id)
+        scrollStats.parked++
+        this._parked.push({ element: { ...element, segments: element.segments.map(segment => ({ ...segment })), reading: false, dirty: false, missed: 0 }, at: Date.now() })
+        if(this._parked.length > PARKED_MAX){
+            this._parked.shift()
+        }
+    }
+
+    /**
+     * Is the text at this place (found by the scout) the text of an element that was somewhere else a moment ago (it scrolled), or one that went out
+     * of sight earlier (it scrolled back)? Gives that element (a remembered one is put back among the elements), or null when the place is not it.
+     */
+    _scrolled(placeBest: Element | null, polarity: Polarity, scan: Region, rect: Region, taken: Set<Element>): Element | null {
+        if((globalThis as any).DLT_NOSCROLL === true){
+            return null
+        }
+        const mask = this._masks[this._polarities.indexOf(polarity)]
+        if(mask === undefined){
+            return null
+        }
+        const { width, height } = this._scanSize
+        const coarse = (element: Element): number => {
+            if(element.sig === null || element.sigGrid === undefined || element.sigSum <= 0){
+                return 1
+            }
+            const current = cellsOf(mask.mask, width, height, scan, element.sigGrid)
+            if(current.sum < element.sigSum * 0.7 || current.sum > element.sigSum * 1.4){
+                return 1
+            }
+            return coreDifference(element.sig, current.cells)
+        }
+
+        // The element that is at this place already and is the same text: nothing moved
+        if(placeBest !== null && placeBest.state === 'text' && placeBest.sig !== null && coarse(placeBest) <= PLACE_MISMATCH){
+            return null
+        }
+
+        let found: Element | null = null
+        let foundScore = SCROLL_PATCH
+        let parked = -1
+        const consider = (element: Element, index: number) => {
+            if(taken.has(element) || element === placeBest || element.reading || element.state !== 'text' || element.segments.length === 0 || element.sigPatch === undefined
+                || element.polarity !== polarity || !similarSize(rect, element.rect) || Math.abs(rect.x - element.rect.x) > SCROLL_MAX_DX || Math.abs(rect.y - element.rect.y) > SCROLL_MAX_DY){
+                return
+            }
+            if(coarse(element) > SCROLL_COARSE){
+                return
+            }
+            const score = patchMatch(element.sigPatch, mask.mask, width, height, scan)
+            if(score > foundScore){
+                found = element
+                foundScore = score
+                parked = index
+            }
+        }
+        for(const element of this._elements){
+            consider(element, -1)
+        }
+        for(let i = 0; i < this._parked.length; i++){
+            if(!this._elements.some(other => other.id === this._parked[i].element.id)){
+                consider(this._parked[i].element, i)
+            }
+        }
+        if(found === null){
+            return null
+        }
+        scrollStats.moved++
+        if(scrollStats.scores.length < 400){
+            scrollStats.scores.push(Math.round(foundScore * 100) / 100)
+        }
+        const element: Element = found
+        if(parked >= 0){
+            scrollStats.restored++
+            // The text is back: the element that was remembered takes the place (what stands there now, not read yet, gives way to it)
+            this._parked.splice(parked, 1)
+            element.seen = Math.max(element.seen, 2)
+            element.missed = 0
+            if(placeBest !== null && placeBest.state !== 'text' && !placeBest.reading){
+                this._elements = this._elements.filter(other => other !== placeBest)
+            }
+            this._elements.push(element)
+        }
+        return element
+    }
+
+    /** A text that scrolled: the element and its translation are moved to the new place. */
+    _relocate(element: Element, rect: Region, scan: Region) {
+        const dx = rect.x - element.rect.x
+        const dy = rect.y - element.rect.y
+        element.segments = element.segments.map(segment => ({ ...segment, rect: { ...segment.rect, x: segment.rect.x + dx, y: segment.rect.y + dy } }))
+        element.rect = rect
+        element.scan = scan
+        element.state = 'text'
     }
 
     /**
@@ -1370,6 +1558,7 @@ export default class ElementsEngine {
             element.sig = current.cells
             element.sigSum = current.sum
             element.sigGrid = { gx: current.gx, gy: current.gy }
+            element.sigPatch = mask === undefined ? undefined : (patchOf(mask.mask, this._scanSize.width, this._scanSize.height, element.scan) ?? undefined)
         }
 
         // A place that only the detector found (a picture, a rock, a pattern that looks like letters) must give a real text: a short word is believed
