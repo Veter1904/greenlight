@@ -70,6 +70,21 @@ const VERIFY_CHANGED = 0.68
 // An element that had nothing to read stays "dead" for this long, unless its pixels change a lot
 const DEAD_MS = 20000
 const REVIVE_CHANGE = 0.55
+// The text under a plate is watched between the looks, in a small grey copy of the picture: when it changes, the next look is
+// called at once instead of waiting for its turn (a plate over a text that has gone must not hang for a second or two)
+const WATCH_MS = 150
+const WATCH_WIDTH = 640
+const WATCH_CELLS_X = 24
+const WATCH_CELLS_Y = 6
+const WATCH_DIFF = 7
+const WATCH_WAKE_GAP_MS = 500
+// A look that finds this much changed under a plate takes the translation away at once (the new text is read after that)
+const HIDE_CHANGED = 0.6
+// A text that is still being typed (or scrolls) is not read: it is read when it has stayed the same between two looks. The looks come
+// faster while something changes. A text that has not settled for this long is read anyway (a text that moves all the time).
+const STILL_DIFF = 0.12
+const FAST_LOOK_MS = 220
+const SETTLE_LIMIT_MS = 5000
 // An element is not read more often than this (a text that is still the same is not worth it)
 const READ_GAP_MS = 600
 const SHOWN_READ_GAP_MS = 1800
@@ -126,6 +141,13 @@ interface Element {
     // new: not read yet; text: has a translation; dead: nothing readable (a false alarm); idle: its text has gone
     state: 'new' | 'text' | 'dead' | 'idle';
     dirty: boolean;
+    // A small grey fingerprint of the place of the text while it is shown (the watch between the looks), and the reading it belongs to
+    watchSig?: Uint8Array;
+    // The signature of the last look and whether the text changed since the look before (typing); since when it has not settled
+    lastCells?: Uint8Array;
+    changing?: boolean;
+    changingSince?: number;
+    watchFor?: number;
     dirtySince: number;
     reading: boolean;
     readAt: number;
@@ -310,6 +332,11 @@ export default class ElementsEngine {
     _running = false
     _ready = false
     _timer: ReturnType<typeof setTimeout> | undefined
+    _watchTimer: ReturnType<typeof setTimeout> | undefined
+    _watchCanvas: HTMLCanvasElement | null = null
+    _scanning = false
+    _lookChanged = false
+    _lastWake = 0
     _readTimer: ReturnType<typeof setTimeout> | undefined
     _elements: Element[] = []
     _nextId = 1
@@ -434,6 +461,7 @@ export default class ElementsEngine {
         })
 
         this._timer = setTimeout(() => this._scan(), 300)
+        this._watchTimer = setTimeout(() => this._watch(), 600)
         this._readTimer = setTimeout(() => this._readLoop(), 500)
     }
 
@@ -443,6 +471,7 @@ export default class ElementsEngine {
             clearTimeout(this._timer)
             this._timer = undefined
         }
+        clearTimeout(this._watchTimer)
         if(this._readTimer !== undefined){
             clearTimeout(this._readTimer)
             this._readTimer = undefined
@@ -465,11 +494,13 @@ export default class ElementsEngine {
         }
 
         const began = Date.now()
+        this._scanning = true
         try {
             await this._scanOnce()
         } catch(error) {
             console.warn('Translator: look failed:', error)
         }
+        this._scanning = false
         this._scanTook = Date.now() - began
         if(this._width > SCAN_WIDTH_SMALL && this._scanTook > SCAN_SLOW_MS){
             this._width = SCAN_WIDTH_SMALL
@@ -479,8 +510,100 @@ export default class ElementsEngine {
 
         if(this._running){
             const speed = this._options.speed?.() ?? 1
-            this._timer = setTimeout(() => this._scan(), Math.max(SCAN_MS * speed, this._scanTook * 8 * Math.max(0.5, speed)))
+            const fast = this._lookChanged
+            this._lookChanged = false
+            this._timer = setTimeout(() => this._scan(), fast ? Math.max(FAST_LOOK_MS, this._scanTook * 3) : Math.max(SCAN_MS * speed, this._scanTook * 8 * Math.max(0.5, speed)))
         }
+    }
+
+    /** Between the looks: is the text under a plate still there? A change calls the next look at once. */
+    async _watch() {
+        if(!this._running){
+            return
+        }
+        try {
+            this._watchOnce()
+        } catch(error) {
+            // a failed watch is only a slower reaction
+        }
+        if(this._running){
+            this._watchTimer = setTimeout(() => this._watch(), WATCH_MS)
+        }
+    }
+
+    _watchOnce() {
+        const shown = this._elements.filter(element => element.state === 'text' && element.segments.length > 0 && !element.reading && !element.dirty)
+        if(shown.length === 0 || document.hidden){
+            return
+        }
+        const video = this._options.getVideo()
+        if(video === null || video.readyState < 2){
+            return
+        }
+        const width = WATCH_WIDTH
+        const height = Math.max(8, Math.round(width * video.videoHeight / Math.max(1, video.videoWidth)))
+        if(this._watchCanvas === null){
+            this._watchCanvas = document.createElement('canvas')
+        }
+        this._watchCanvas.width = width
+        this._watchCanvas.height = height
+        const context = this._watchCanvas.getContext('2d', { willReadFrequently: true })
+        if(context === null){
+            return
+        }
+        // the whole picture of the game (the plates are not in it: it is the picture the engine reads)
+        context.drawImage(video, 0, 0, video.videoWidth, video.videoHeight, 0, 0, width, height)
+        const data = context.getImageData(0, 0, width, height).data
+        let wake = false
+        for(const element of shown){
+            const sig = this._fingerprint(data, width, height, element.scan)
+            if(element.watchSig === undefined || element.watchFor !== element.readAt){
+                element.watchSig = sig
+                element.watchFor = element.readAt
+                continue
+            }
+            let sum = 0
+            for(let i = 0; i < sig.length; i++){
+                sum += Math.abs(sig[i] - element.watchSig[i])
+            }
+            if(sum / sig.length > WATCH_DIFF){
+                element.watchSig = sig
+                wake = true
+            }
+        }
+        if(wake && !this._scanning && Date.now() - this._lastWake >= WATCH_WAKE_GAP_MS){
+            this._lastWake = Date.now()
+            clearTimeout(this._timer)
+            this._timer = setTimeout(() => this._scan(), 10)
+        }
+    }
+
+    /** Mean grey of a grid of cells over a place (fractions of the picture). */
+    _fingerprint(data: Uint8ClampedArray, width: number, height: number, place: Region): Uint8Array {
+        const out = new Uint8Array(WATCH_CELLS_X * WATCH_CELLS_Y)
+        const x0 = Math.max(0, Math.floor(place.x * width))
+        const y0 = Math.max(0, Math.floor(place.y * height))
+        const w = Math.max(1, Math.min(width - x0, Math.ceil(place.w * width)))
+        const h = Math.max(1, Math.min(height - y0, Math.ceil(place.h * height)))
+        for(let cy = 0; cy < WATCH_CELLS_Y; cy++){
+            for(let cx = 0; cx < WATCH_CELLS_X; cx++){
+                const ax = x0 + Math.floor(cx * w / WATCH_CELLS_X)
+                const bx = Math.max(ax + 1, x0 + Math.floor((cx + 1) * w / WATCH_CELLS_X))
+                const ay = y0 + Math.floor(cy * h / WATCH_CELLS_Y)
+                const by = Math.max(ay + 1, y0 + Math.floor((cy + 1) * h / WATCH_CELLS_Y))
+                let sum = 0
+                let count = 0
+                for(let y = ay; y < by && y < height; y++){
+                    for(let x = ax; x < bx && x < width; x++){
+                        const o = (y * width + x) * 4
+                        sum += data[o] * 0.299 + data[o + 1] * 0.587 + data[o + 2] * 0.114
+                        count++
+                    }
+                }
+                out[cy * WATCH_CELLS_X + cx] = count > 0 ? Math.round(sum / count) : 0
+            }
+        }
+        return out
     }
 
     async _scanOnce() {
@@ -771,6 +894,17 @@ export default class ElementsEngine {
         }
         const current = cellsOf(mask.mask, this._scanSize.width, this._scanSize.height, scan)
 
+        // Is the text still changing (typed letter by letter)?
+        const moved = element.lastCells !== undefined && cellsDifference(element.lastCells, current.cells) > STILL_DIFF
+        element.lastCells = current.cells
+        if(moved){
+            if(element.changing !== true){
+                element.changingSince = now
+            }
+            this._lookChanged = true
+        }
+        element.changing = moved
+
         if(element.state === 'new'){
             if(!element.dirty && element.seen >= this._need(element)){
                 element.dirty = true
@@ -800,6 +934,12 @@ export default class ElementsEngine {
                 element.state = 'idle'
             }
             return
+        }
+
+        // Most of the text pixels are others than what was read: the translation does not belong here any more
+        if(difference > HIDE_CHANGED && element.segments.length > 0){
+            element.segments = []
+            element.state = 'idle'
         }
 
         // The text is back after it had gone (or the text pixels changed): the element is read again
@@ -860,6 +1000,9 @@ export default class ElementsEngine {
             }
             const gap = (element.state === 'text' ? SHOWN_READ_GAP_MS : READ_GAP_MS) * (this._options.speed?.() ?? 1)
             if(now - element.readAt < gap){
+                continue
+            }
+            if(element.changing === true && now - (element.changingSince ?? now) < SETTLE_LIMIT_MS){
                 continue
             }
 
@@ -947,6 +1090,16 @@ export default class ElementsEngine {
         element.reading = false
 
         if(!this._running || !this._elements.includes(element)){
+            return
+        }
+
+        // The text changed while it was being read (it was typed on): what was read is a part of it, and it is not shown. The next
+        // reading is called at once (the gap between two readings does not apply).
+        if(current !== null && element.lastCells !== undefined && Date.now() - (element.changingSince ?? Date.now()) < SETTLE_LIMIT_MS
+            && (element.lastCells.length !== current.cells.length || cellsDifference(current.cells, element.lastCells) > STILL_DIFF * 1.5)){
+            element.dirty = true
+            element.dirtySince = Date.now()
+            element.readAt = 0
             return
         }
 

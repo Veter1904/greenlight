@@ -361,6 +361,40 @@ export function toTranslatable(text: string): string {
     return lower.charAt(0).toUpperCase() + lower.slice(1)
 }
 
+// Letters and digits that look alike are mixed up by the reader in stylized fonts ("WHAT 15 IT?" is "WHAT IS IT?"). Only whole words that are
+// a digit-letter mixture of a common little word are mended, and a bare "15" only inside a line of capitals.
+const DIGIT_WORDS: Record<string, string> = {
+    'I5': 'IS', '1S': 'IS', '1T': 'IT', '0F': 'OF', '0N': 'ON', '0R': 'OR', 'T0': 'TO', 'S0': 'SO', 'N0': 'NO', 'G0': 'GO', 'D0': 'DO', '1F': 'IF', '1N': 'IN', 'B3': 'BE', 'H3': 'HE', 'W3': 'WE', 'M3': 'ME',
+}
+
+const BEFORE_IS = new Set(['WHAT', 'WHERE', 'WHO', 'WHY', 'HOW', 'THIS', 'THAT', 'IT', 'HE', 'SHE', 'THERE', 'HERE'])
+const AFTER_IS = new Set(['IT', 'THIS', 'THAT', 'THE', 'A', 'AN', 'NOT', 'YOUR', 'MY', 'HE', 'SHE', 'WE', 'YOU', 'THERE', 'HERE'])
+
+function fixLetterDigits(line: string): string {
+    const tokens = line.split(' ')
+    if(tokens.length < 3){
+        return line
+    }
+    const letters: string[] = line.match(LETTER) || []
+    const capitals = letters.length >= 4 && letters.filter(letter => letter !== letter.toLowerCase()).length / letters.length >= 0.9
+    const otherDigits = (token: string) => /\d/.test(token)
+    return tokens.map((token, index) => {
+        const core = token.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '')
+        const start = Math.max(0, token.indexOf(core))
+        const word = (i: number) => (tokens[i] ?? '').replace(/[^A-Za-z]/g, '').toUpperCase()
+        const mended = DIGIT_WORDS[core.toUpperCase()] ?? (capitals && core === '15' && (BEFORE_IS.has(word(index - 1)) || AFTER_IS.has(word(index + 1))) && tokens.filter((other, i) => i !== index && otherDigits(other)).length === 0 ? 'IS' : undefined)
+        return mended === undefined ? token : token.slice(0, start) + mended + token.slice(start + core.length)
+    }).join(' ')
+}
+
+// A reading that is one little word no language has ("Qwy", "tgk"): a speck of the picture read as letters
+function isJunkWord(text: string): boolean {
+    if(!/^[A-Za-z]{2,5}$/.test(text) || text === text.toUpperCase()){
+        return false
+    }
+    return !/[aeiouy]/i.test(text) || /q(?!u)/i.test(text)
+}
+
 /** Cleans what the text reader found and returns '' when it does not look like real text. */
 export function cleanOcrText(raw: string): string {
     const lines = raw.replace(/\|/g, ' ').split(/\r?\n/)
@@ -391,7 +425,7 @@ export function cleanOcrText(raw: string): string {
         while(tokens.length >= 2 && (isStrayLetter(tokens[tokens.length - 1]) || isBracketJunk(tokens[tokens.length - 1]) || isSmallJunk(tokens[tokens.length - 1], tokens.slice(0, -1)))){
             tokens.pop()
         }
-        cleaned = tokens.join(' ')
+        cleaned = fixLetterDigits(tokens.join(' '))
 
         kept.push(cleaned)
     }
@@ -400,7 +434,7 @@ export function cleanOcrText(raw: string): string {
     const text = kept.join(' ').replace(/(^|\s)[.,:;]+(?=\s|$)/g, ' ').replace(/\s+/g, ' ').trim()
     const letters = (text.match(LETTER) || []).length
 
-    return letters >= 3 ? text : ''
+    return letters >= 3 && !isJunkWord(text) ? text : ''
 }
 
 export function normalizeText(text: string): string {
