@@ -765,6 +765,10 @@ function breathe(): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, 0))
 }
 
+// A single row of text: up to this tall (pixels of the picture) it is enlarged so that its height is about SINGLE_ROW_TARGET
+const SINGLE_ROW_MAX = 110
+const SINGLE_ROW_TARGET = 64
+
 export default class TranslatorEngine {
 
     _options: EngineOptions
@@ -2091,6 +2095,10 @@ export default class TranslatorEngine {
     async _prepareForReading(frame: HTMLCanvasElement, source: SourceRect, polarity: Polarity, raw: boolean | 'stretched' = false): Promise<PreparedImage | null> {
         // Small interface text needs to be enlarged a lot to be read reliably
         let scale = Math.min(3, Math.max(2, 1300 / source.sw))
+        // A single row of big letters is enlarged less (the reader needs letters of about this height, and the time grows with the pixels)
+        if(source.sh <= SINGLE_ROW_MAX && source.sw >= source.sh * 2){
+            scale = Math.min(scale, Math.max(1.2, SINGLE_ROW_TARGET / source.sh))
+        }
         // A big window (the whole screen) is not enlarged as much: the time of the reader grows with the number of pixels
         if(source.sw * source.sh * scale * scale > MAX_OCR_PIXELS){
             scale = Math.max(1, Math.sqrt(MAX_OCR_PIXELS / (source.sw * source.sh)))
