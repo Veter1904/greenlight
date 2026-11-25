@@ -1128,6 +1128,43 @@ export default class ElementsEngine {
             })
         }
 
+        // The same text can be found twice: as a line of its own and inside a bigger piece (a speech box with its name tab and its text,
+        // when the frame of the box is drawn by hand and moves a little). One plate per place: the one of the tighter, smaller piece stays.
+        const areas = new Map<number, number>(this._elements.map(element => [element.id, element.rect.w * element.rect.h]))
+        const flat = results.flatMap(item => item.result.segments.map(segment => ({ item, segment })))
+        const dropped = new Set<TranslatedSegment>()
+        for(const a of flat){
+            for(const b of flat){
+                if(a === b || a.item === b.item || dropped.has(b.segment)){
+                    continue
+                }
+                const smaller = Math.min(a.segment.rect.w * a.segment.rect.h, b.segment.rect.w * b.segment.rect.h)
+                if(smaller <= 0 || inside(a.segment.rect, b.segment.rect) * (a.segment.rect.w * a.segment.rect.h) / smaller < 0.5){
+                    continue
+                }
+                // only the same text : another text at the same place is not a copy
+                const textA = a.segment.original.toUpperCase().replace(/[^\p{L}\p{N}]/gu, '')
+                const textB = b.segment.original.toUpperCase().replace(/[^\p{L}\p{N}]/gu, '')
+                if(textA.length === 0 || textB.length === 0 || textA !== textB){
+                    continue
+                }
+                const areaA = areas.get(a.item.id) ?? 0
+                const areaB = areas.get(b.item.id) ?? 0
+                if(areaA > areaB || (areaA === areaB && a.item.id > b.item.id)){
+                    dropped.add(a.segment)
+                    break
+                }
+            }
+        }
+        if(dropped.size > 0){
+            for(const item of results){
+                item.result.segments = item.result.segments.filter(segment => !dropped.has(segment))
+                item.result.original = item.result.segments.map(segment => segment.original).join(' ')
+                item.result.translated = item.result.segments.map(segment => segment.translated).join('\n')
+            }
+            results.splice(0, results.length, ...results.filter(item => item.result.segments.length > 0))
+        }
+
         const key = JSON.stringify(results.map(item => [item.id, item.result.translated, item.result.segments.map(segment => [Math.round(segment.rect.x * 1000), Math.round(segment.rect.y * 1000), Math.round(segment.rect.w * 1000)])]))
         if(key !== this._lastKey){
             this._lastKey = key
