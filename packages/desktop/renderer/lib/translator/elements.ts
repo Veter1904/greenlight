@@ -639,8 +639,10 @@ export default class ElementsEngine {
      * not replace them, or everything looks changed). It only answers one question: is the text under a plate still the same? An element
      * whose text pixels differ a lot from what was read is read again.
      */
-    async verifyAgainst(pixels: Uint8ClampedArray, width: number, height: number): Promise<{ checked: number; changed: number; differences: number[] }> {
-        const result = { checked: 0, changed: 0, differences: [] as number[] }
+    async verifyAgainst(pixels: Uint8ClampedArray, width: number, height: number): Promise<{ checked: number; changed: number; differences: number[]; rects: Region[] }> {
+        // `rects`: where the text changed (fractions of the picture): the caller puts the new pixels of these places into the picture the
+        // engine reads, which still holds the old ones under a plate
+        const result = { checked: 0, changed: 0, differences: [] as number[], rects: [] as Region[] }
         if(!this._running){
             return result
         }
@@ -665,6 +667,7 @@ export default class ElementsEngine {
                 element.dirty = true
                 element.dirtySince = now
                 result.changed++
+                result.rects.push({ x: element.rect.x, y: element.rect.y, w: element.rect.w, h: element.rect.h })
             }
         }
         return result
