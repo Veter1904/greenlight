@@ -116,6 +116,15 @@ const MOVE_TOLERANCE = 0.006
 // ... the coarse look at the letters must say they are alike (this only picks the candidates), then the text pixels themselves must lie on each other
 const SCROLL_COARSE = 0.42
 const SCROLL_PATCH = 0.5
+// A line that is cut by the edge of its window: the visible part is between these shares of the whole line, and the letters in it must lie on the same part of the whole
+const CLIP_MIN = 0.25
+const CLIP_MAX = 0.8
+const CLIP_PATCH = 0.55
+// The fastest a text may scroll (screens per second) for the speed to be believed
+const MOTION_MAX = 1.5
+// A piece of text that is much smaller than the lines next to it is the end of a line that is cut by an edge: it waits longer (more looks) before it is read
+const SLIVER_SHARE = 0.6
+const SLIVER_LOOKS = 3
 // ... how far it may have gone (fractions of the screen)
 const SCROLL_MAX_DX = 0.04
 const SCROLL_MAX_DY = 0.4
@@ -125,7 +134,7 @@ const PLACE_MISMATCH = 0.45
 const PARKED_MAX = 80
 const PARKED_MAX_AGE_MS = 120000
 // How many texts were followed when they scrolled, were put back from the memory, and were put into it (for tests)
-export const scrollStats = { moved: 0, restored: 0, parked: 0, scores: [] as number[] }
+export const scrollStats = { moved: 0, restored: 0, parked: 0, clipped: 0, scores: [] as number[] }
 // A translation that has got a better version is replaced only while it is young
 const BETTER_MS = 4000
 // Pieces of text that are at least this tall (fractions of the screen) and not further apart than this many heights are one title
@@ -204,6 +213,10 @@ interface Element {
     sigGrid?: { gx: number; gy: number };
     // The text pixels as they were when it was read (to know the text again when it has moved)
     sigPatch?: Patch;
+    // When the place was last confirmed, how fast the text is moving, and which part of it is seen when the edge of a window cuts it
+    placedAt?: number;
+    motion?: { vx: number; vy: number; at: number; sustained: boolean };
+    clip?: Region;
     segments: Segment[];
 }
 
@@ -373,6 +386,46 @@ interface Patch {
     w: number;
     h: number;
     ink: Int32Array;
+    // The rows and columns the letters really take (inclusive): the box around them is not exact
+    top: number;
+    bottom: number;
+    left: number;
+    right: number;
+}
+
+/** The rows and columns the letters take at a place now (rows with a few ink pixels only count: a speck is not a letter). */
+function inkExtent(mask: Uint8Array, width: number, height: number, box: Region): { top: number; bottom: number; left: number; right: number } | null {
+    const x0 = Math.max(0, Math.floor(box.x * width))
+    const y0 = Math.max(0, Math.floor(box.y * height))
+    const x1 = Math.min(width, Math.ceil((box.x + box.w) * width))
+    const y1 = Math.min(height, Math.ceil((box.y + box.h) * height))
+    let top = -1
+    let bottom = -1
+    let left = Infinity
+    let right = -1
+    for(let y = y0; y < y1; y++){
+        let count = 0
+        let first = -1
+        let last = -1
+        for(let x = x0; x < x1; x++){
+            if(mask[y * width + x] === 1){
+                count++
+                if(first < 0){
+                    first = x
+                }
+                last = x
+            }
+        }
+        if(count >= 2){
+            if(top < 0){
+                top = y
+            }
+            bottom = y
+            left = Math.min(left, first)
+            right = Math.max(right, last)
+        }
+    }
+    return top < 0 ? null : { top, bottom, left, right }
 }
 
 function patchOf(mask: Uint8Array, width: number, height: number, box: Region): Patch | null {
@@ -392,7 +445,22 @@ function patchOf(mask: Uint8Array, width: number, height: number, box: Region): 
             }
         }
     }
-    return list.length < 20 ? null : { w, h: y1 - y0, ink: Int32Array.from(list) }
+    if(list.length < 20){
+        return null
+    }
+    let top = Infinity
+    let bottom = -1
+    let left = Infinity
+    let right = -1
+    for(const position of list){
+        const row = Math.floor(position / w)
+        const column = position % w
+        top = Math.min(top, row)
+        bottom = Math.max(bottom, row)
+        left = Math.min(left, column)
+        right = Math.max(right, column)
+    }
+    return { w, h: y1 - y0, ink: Int32Array.from(list), top, bottom, left, right }
 }
 
 /** How well the letters of a patch lie on the letters at a place now (0..1: the same text, a few pixels off, is about 0.7 and more; another text 0.3 and less). */
@@ -421,6 +489,52 @@ function patchMatch(patch: Patch, mask: Uint8Array, width: number, height: numbe
                 }
             }
             best = Math.max(best, 2 * hits / (patch.ink.length + there))
+        }
+    }
+    return best
+}
+
+/**
+ * A line cut by the edge of its window: only the upper (edge 'top') or the lower (edge 'bottom') part of the patch is seen in the box. How well do the
+ * letters of that part lie on the letters in the box (0..1)?
+ */
+function patchMatchPartial(patch: Patch, mask: Uint8Array, width: number, height: number, extent: { top: number; bottom: number; left: number; right: number }, edge: 'top' | 'bottom'): number {
+    const seen = extent.bottom - extent.top + 1
+    const rowStart = edge === 'top' ? patch.top : patch.bottom - seen + 1
+    let used = 0
+    for(let i = 0; i < patch.ink.length; i++){
+        const row = Math.floor(patch.ink[i] / patch.w)
+        if(row >= rowStart && row < rowStart + seen){
+            used++
+        }
+    }
+    if(used < 12){
+        return 0
+    }
+    let there = 0
+    for(let y = extent.top; y <= extent.bottom; y++){
+        for(let x = extent.left; x <= extent.right; x++){
+            if(mask[y * width + x] === 1){
+                there++
+            }
+        }
+    }
+    let best = 0
+    for(let dy = -1; dy <= 1; dy++){
+        for(let dx = -3; dx <= 3; dx++){
+            let hits = 0
+            for(let i = 0; i < patch.ink.length; i++){
+                const row = Math.floor(patch.ink[i] / patch.w)
+                if(row < rowStart || row >= rowStart + seen){
+                    continue
+                }
+                const x = extent.left + dx + (patch.ink[i] % patch.w - patch.left)
+                const y = extent.top + dy + (row - rowStart)
+                if(x >= 0 && x < width && y >= 0 && y < height && mask[y * width + x] === 1){
+                    hits++
+                }
+            }
+            best = Math.max(best, 2 * hits / (used + there))
         }
     }
     return best
@@ -1050,9 +1164,21 @@ export default class ElementsEngine {
 
             // A text that scrolled: the place says it is another element (or none), the pixels of the letters say whose text it is
             const scrolled = this._scrolled(best, block.polarity, scan, rect, taken)
+            let followRect = rect
+            let clipped = false
             if(scrolled !== null){
-                this._relocate(scrolled, rect, scan)
-                best = scrolled
+                if(scrolled.edge === null){
+                    this._relocate(scrolled.element, rect, scan)
+                } else {
+                    // The edge of the window cuts the line: the plate keeps the size of the whole line and is cut like it
+                    const whole = scrolled.element.rect
+                    followRect = { x: rect.x, w: whole.w, h: whole.h, y: scrolled.edge === 'top' ? rect.y : rect.y + rect.h - whole.h }
+                    this._relocate(scrolled.element, followRect, scan)
+                    scrolled.element.clip = rect
+                    clipped = true
+                    scrollStats.clipped++
+                }
+                best = scrolled.element
             }
 
             if(best === null){
@@ -1067,7 +1193,7 @@ export default class ElementsEngine {
                 this._elements.push(best)
             }
             taken.add(best)
-            this._follow(best, rect, scan, panel, block.role, block.plate, block.polarity, block.score, now)
+            this._follow(best, followRect, scan, panel, block.role, block.plate, block.polarity, block.score, now, clipped)
         }
 
         // Elements that were not found this time
@@ -1115,7 +1241,7 @@ export default class ElementsEngine {
      * Is the text at this place (found by the scout) the text of an element that was somewhere else a moment ago (it scrolled), or one that went out
      * of sight earlier (it scrolled back)? Gives that element (a remembered one is put back among the elements), or null when the place is not it.
      */
-    _scrolled(placeBest: Element | null, polarity: Polarity, scan: Region, rect: Region, taken: Set<Element>): Element | null {
+    _scrolled(placeBest: Element | null, polarity: Polarity, scan: Region, rect: Region, taken: Set<Element>): { element: Element; edge: 'top' | 'bottom' | null } | null {
         if((globalThis as any).DLT_NOSCROLL === true){
             return null
         }
@@ -1134,27 +1260,53 @@ export default class ElementsEngine {
             }
             return coreDifference(element.sig, current.cells)
         }
+        // The piece is a part of the line of the element: the edge of a window cuts the line (the letters of the piece are much lower than the letters of the line)
+        const extent = inkExtent(mask.mask, width, height, scan)
+        const cutOf = (element: Element) => {
+            if(extent === null || element.sigPatch === undefined){
+                return false
+            }
+            const whole = element.sigPatch.bottom - element.sigPatch.top + 1
+            const seen = extent.bottom - extent.top + 1
+            const across = element.sigPatch.right - element.sigPatch.left + 1
+            return seen < whole * CLIP_MAX && seen > whole * CLIP_MIN && extent.right - extent.left + 1 > across * 0.5 && extent.right - extent.left + 1 < across * 1.3
+        }
 
         // The element that is at this place already and is the same text: nothing moved
-        if(placeBest !== null && placeBest.state === 'text' && placeBest.sig !== null && coarse(placeBest) <= PLACE_MISMATCH){
+        if(placeBest !== null && placeBest.state === 'text' && placeBest.sig !== null && !cutOf(placeBest) && coarse(placeBest) <= PLACE_MISMATCH){
             return null
         }
 
-        let found: Element | null = null
+        let found = null as Element | null
+        let foundEdge: 'top' | 'bottom' | null = null
         let foundScore = SCROLL_PATCH
         let parked = -1
         const consider = (element: Element, index: number) => {
-            if(taken.has(element) || element === placeBest || element.reading || element.state !== 'text' || element.segments.length === 0 || element.sigPatch === undefined
-                || element.polarity !== polarity || !similarSize(rect, element.rect) || Math.abs(rect.x - element.rect.x) > SCROLL_MAX_DX || Math.abs(rect.y - element.rect.y) > SCROLL_MAX_DY){
+            const cut = cutOf(element)
+            if(taken.has(element) || (element === placeBest && !cut) || element.reading || element.state !== 'text' || element.segments.length === 0 || element.sigPatch === undefined
+                || element.polarity !== polarity || Math.abs(rect.x - element.rect.x) > SCROLL_MAX_DX || Math.abs(rect.y - element.rect.y) > SCROLL_MAX_DY + element.rect.h){
                 return
             }
-            if(coarse(element) > SCROLL_COARSE){
+            if(cut && extent !== null){
+                const top = patchMatchPartial(element.sigPatch, mask.mask, width, height, extent, 'top')
+                const bottom = patchMatchPartial(element.sigPatch, mask.mask, width, height, extent, 'bottom')
+                const score = Math.max(top, bottom)
+                if(score >= CLIP_PATCH && score > foundScore){
+                    found = element
+                    foundScore = score
+                    foundEdge = top >= bottom ? 'top' : 'bottom'
+                    parked = index
+                }
+                return
+            }
+            if(!similarSize(rect, element.rect) || coarse(element) > SCROLL_COARSE){
                 return
             }
             const score = patchMatch(element.sigPatch, mask.mask, width, height, scan)
             if(score > foundScore){
                 found = element
                 foundScore = score
+                foundEdge = null
                 parked = index
             }
         }
@@ -1185,7 +1337,7 @@ export default class ElementsEngine {
             }
             this._elements.push(element)
         }
-        return element
+        return { element, edge: foundEdge }
     }
 
     /** A text that scrolled: the element and its translation are moved to the new place. */
@@ -1193,9 +1345,25 @@ export default class ElementsEngine {
         const dx = rect.x - element.rect.x
         const dy = rect.y - element.rect.y
         element.segments = element.segments.map(segment => ({ ...segment, rect: { ...segment.rect, x: segment.rect.x + dx, y: segment.rect.y + dy } }))
+        this._noteMotion(element, dx, dy, Date.now())
         element.rect = rect
         element.scan = scan
         element.state = 'text'
+        element.clip = undefined
+    }
+
+    /** How fast a text is moving (the way it went since the place was last confirmed, over the time that has passed), and whether it keeps going the same way. */
+    _noteMotion(element: Element, dx: number, dy: number, now: number) {
+        const seconds = Math.max(0.25, (now - (element.placedAt ?? now - 500)) / 1000)
+        let vx = Math.max(-MOTION_MAX, Math.min(MOTION_MAX, dx / seconds))
+        let vy = Math.max(-MOTION_MAX, Math.min(MOTION_MAX, dy / seconds))
+        const before = element.motion
+        const sustained = before !== undefined && now - before.at < 1200 && vx * before.vx + vy * before.vy > 0
+        if(sustained && before !== undefined){
+            vx = (vx + before.vx) / 2
+            vy = (vy + before.vy) / 2
+        }
+        element.motion = { vx, vy, at: now, sustained }
     }
 
     /**
@@ -1304,7 +1472,7 @@ export default class ElementsEngine {
     }
 
     /** An element was found again: its place is followed, and its text pixels say whether it has to be read (again). */
-    _follow(element: Element, rect: Region, scan: Region, panel: Region | undefined, role: BlockRole, plate: boolean, polarity: Polarity, score: number, now: number) {
+    _follow(element: Element, rect: Region, scan: Region, panel: Region | undefined, role: BlockRole, plate: boolean, polarity: Polarity, score: number, now: number, clipped = false) {
         element.missed = 0
         element.seen++
         element.score = Math.max(element.score * 0.9, score)
@@ -1318,11 +1486,21 @@ export default class ElementsEngine {
         const dy = rect.y - element.rect.y
         if((Math.abs(dx) >= MOVE_TOLERANCE || Math.abs(dy) >= MOVE_TOLERANCE) && similarSize(rect, element.rect)){
             element.segments = element.segments.map(segment => ({ ...segment, rect: { ...segment.rect, x: segment.rect.x + dx, y: segment.rect.y + dy } }))
+            this._noteMotion(element, dx, dy, now)
             element.rect = rect
         } else if(!similarSize(rect, element.rect)){
             element.rect = rect
         }
         element.scan = scan
+        element.placedAt = now
+
+        // A line that the edge of its window cuts is not read, nor compared with what was read (its pixels are a part of the line): it is only followed
+        if(clipped){
+            element.lastCells = undefined
+            element.changing = false
+            return
+        }
+        element.clip = undefined
 
         const polarityIndex = this._polarities.indexOf(element.polarity)
         const mask = this._masks[polarityIndex]
@@ -1392,6 +1570,11 @@ export default class ElementsEngine {
         let need = element.role === 'subtitle' ? 1 : (element.plate || element.role === 'notice' ? 2 : 3)
         if(centralness(element.rect) > 0){
             need = Math.min(need, 2)
+        }
+        // A piece much smaller than the lines next to it is the end of a line that an edge cuts (a text that scrolls): it is read when it has stayed
+        const heights = this._elements.filter(other => other !== element && other.state === 'text' && Math.abs(other.rect.x - element.rect.x) < 0.04).map(other => other.rect.h).sort((a, b) => a - b)
+        if(heights.length >= 2 && element.rect.h < heights[Math.floor(heights.length / 2)] * SLIVER_SHARE){
+            need += SLIVER_LOOKS
         }
         // A picture with very many pieces of text (a busy moving background) is looked at more carefully before a piece is read: it is mostly false alarms
         return need + (element.polarity === 'dark' ? 1 : 0) + Math.floor(this._elements.length / 14)
@@ -1740,9 +1923,12 @@ export default class ElementsEngine {
             if(element.state !== 'text' || element.segments.length === 0){
                 continue
             }
+            const moving = element.motion !== undefined && Date.now() - element.motion.at < 1000 ? element.motion : undefined
             const segments: TranslatedSegment[] = element.segments.map(segment => ({
                 original: segment.original, translated: segment.translated, rect: segment.rect, lineHeight: segment.lineHeight,
                 background: segment.background, foreground: segment.foreground, centered: segment.centered, shownAt: segment.shownAt,
+                ...(moving !== undefined ? { motion: moving } : {}),
+                ...(element.clip !== undefined ? { clip: element.clip } : {}),
             }))
             results.push({
                 id: element.id,
@@ -1793,7 +1979,7 @@ export default class ElementsEngine {
             results.splice(0, results.length, ...results.filter(item => item.result.segments.length > 0))
         }
 
-        const key = JSON.stringify(results.map(item => [item.id, item.result.translated, item.result.segments.map(segment => [Math.round(segment.rect.x * 1000), Math.round(segment.rect.y * 1000), Math.round(segment.rect.w * 1000), segment.background[0] >> 3, segment.background[1] >> 3, segment.background[2] >> 3])]))
+        const key = JSON.stringify(results.map(item => [item.id, item.result.translated, item.result.segments.map(segment => [Math.round(segment.rect.x * 1000), Math.round(segment.rect.y * 1000), Math.round(segment.rect.w * 1000), segment.background[0] >> 3, segment.background[1] >> 3, segment.background[2] >> 3, segment.clip === undefined ? 0 : Math.round(segment.clip.y * 1000) * 1000 + Math.round(segment.clip.h * 1000)])]))
         if(key !== this._lastKey){
             this._lastKey = key
             this._options.onResults(results)

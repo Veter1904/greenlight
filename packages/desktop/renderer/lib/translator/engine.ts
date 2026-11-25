@@ -46,6 +46,10 @@ export interface TranslatedSegment {
     centered: boolean;
     // When it was put on screen (the newer of two translations that overlap stays)
     shownAt?: number;
+    // A text that scrolls: where it is going (fractions of the stream area per second), when that was measured, and whether it has been going for more than one look
+    motion?: { vx: number; vy: number; at: number; sustained: boolean };
+    // The part of the text that is seen: the edge of its window cuts it (a list that scrolls), and the plate is cut the same way
+    clip?: Region;
 }
 
 export interface TranslatorResult {
