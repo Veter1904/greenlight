@@ -142,6 +142,10 @@ interface Segment extends TranslatedSegment {
     base?: [number, number, number];
     // The colour of the letters now
     ink?: [number, number, number];
+    // When the colour of the background was last followed, the picture behind the text at the first look and the colour of the plate that belonged to it
+    baseAt?: number;
+    behindRef?: [number, number, number];
+    base0?: [number, number, number];
     // Brightness of the letters as the reader saw them (the first colour of the plate): the colour of the ink must be on the same side of the background
     fgLuma0?: number;
 }
@@ -301,6 +305,35 @@ function inkColor(pixels: Uint8ClampedArray, mask: Uint8Array, width: number, he
 }
 
 /** The colours of a plate: the text keeps the colour of the original letters; the plate is made dark or light enough to read it. */
+/** The mean colour of the pixels of a place that are not letters (what the plate imitates). */
+function backgroundColor(pixels: Uint8ClampedArray, mask: Uint8Array, width: number, height: number, box: Region): [number, number, number] | null {
+    const x0 = Math.max(0, Math.floor(box.x * width))
+    const y0 = Math.max(0, Math.floor(box.y * height))
+    const x1 = Math.min(width, Math.ceil((box.x + box.w) * width))
+    const y1 = Math.min(height, Math.ceil((box.y + box.h) * height))
+    let r = 0
+    let g = 0
+    let b = 0
+    let count = 0
+    for(let y = y0; y < y1; y += 2){
+        for(let x = x0; x < x1; x += 2){
+            const i = y * width + x
+            if(mask[i] === 0){
+                r += pixels[i * 4]
+                g += pixels[i * 4 + 1]
+                b += pixels[i * 4 + 2]
+                count++
+            }
+        }
+    }
+    return count < 12 ? null : [Math.round(r / count), Math.round(g / count), Math.round(b / count)]
+}
+
+// The plate follows the colour of the picture behind the text (a moving background, a menu entry that is chosen) without a new reading: the letters
+// are what the engine holds on to, the background is only imitated
+const BACKGROUND_CHANGED = 24
+const BACKGROUND_EVERY_MS = 700
+
 function plateColors(base: [number, number, number], ink: [number, number, number]): { background: [number, number, number]; foreground: string } {
     const baseLight = brightnessOf(base)
     const inkLight = brightnessOf(ink)
@@ -840,6 +873,36 @@ export default class ElementsEngine {
                     h: segment.rect.h / element.rect.h * element.scan.h,
                 }
                 const color = inkColor(pixels, mask.mask, width, height, box, element.polarity)
+                // The background of the plate follows the picture behind the text (smoothed, now and then): the text is not read again for it
+                const followedAt = Date.now()
+                if(segment.baseAt === undefined || followedAt - segment.baseAt >= BACKGROUND_EVERY_MS){
+                    const behind = backgroundColor(pixels, mask.mask, width, height, box)
+                    const letters = segment.ink ?? (cssColor(segment.foreground) as [number, number, number] | null)
+                    if(behind !== null && segment.behindRef === undefined){
+                        // The first look is the reference: the colours of the reading are kept, only a change of the picture behind the text moves them
+                        segment.behindRef = behind
+                        segment.base0 = segment.base ?? segment.background
+                    } else if(behind !== null && segment.behindRef !== undefined && segment.base0 !== undefined && letters !== null){
+                        const shift = [behind[0] - segment.behindRef[0], behind[1] - segment.behindRef[1], behind[2] - segment.behindRef[2]]
+                        if(Math.hypot(shift[0], shift[1], shift[2]) > BACKGROUND_CHANGED){
+                            const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)))
+                            const target: [number, number, number] = [clamp(segment.base0[0] + shift[0]), clamp(segment.base0[1] + shift[1]), clamp(segment.base0[2] + shift[2])]
+                            const was = segment.base ?? segment.background
+                            const blended: [number, number, number] = [clamp(was[0] * 0.5 + target[0] * 0.5), clamp(was[1] * 0.5 + target[1] * 0.5), clamp(was[2] * 0.5 + target[2] * 0.5)]
+                            segment.base = blended
+                            const followed = plateColors(blended, letters)
+                            segment.background = followed.background
+                            segment.foreground = followed.foreground
+                        } else if(segment.base !== undefined && Math.hypot(segment.base[0] - segment.base0[0], segment.base[1] - segment.base0[1], segment.base[2] - segment.base0[2]) > 6 && letters !== null){
+                            // the picture is back as it was: the plate too
+                            segment.base = segment.base0
+                            const followed = plateColors(segment.base0, letters)
+                            segment.background = followed.background
+                            segment.foreground = followed.foreground
+                        }
+                    }
+                    segment.baseAt = followedAt
+                }
                 // The colour of the letters must be on the same side of the background as the letters the reader saw (a text in light letters on a dark bar
                 // is not turned into dark ones because the mask of the other polarity caught the bar itself)
                 const luma = (c: number[]) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
@@ -1541,7 +1604,7 @@ export default class ElementsEngine {
             results.splice(0, results.length, ...results.filter(item => item.result.segments.length > 0))
         }
 
-        const key = JSON.stringify(results.map(item => [item.id, item.result.translated, item.result.segments.map(segment => [Math.round(segment.rect.x * 1000), Math.round(segment.rect.y * 1000), Math.round(segment.rect.w * 1000)])]))
+        const key = JSON.stringify(results.map(item => [item.id, item.result.translated, item.result.segments.map(segment => [Math.round(segment.rect.x * 1000), Math.round(segment.rect.y * 1000), Math.round(segment.rect.w * 1000), segment.background[0] >> 3, segment.background[1] >> 3, segment.background[2] >> 3])]))
         if(key !== this._lastKey){
             this._lastKey = key
             this._options.onResults(results)
