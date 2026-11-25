@@ -368,7 +368,9 @@ function splitRows(part: Part, ink: Uint16Array, columns: number): Part[] {
 }
 
 // A part wider than the limit for a block is cut where there is a wide empty gap (a row of buttons, a table: not one text)
-const SPLIT_GAP_CELLS = 10
+const SPLIT_GAP_CELLS = 8
+// A part wider than this (fraction of the picture) is cut at the empty gaps
+const SPLIT_WIDTH = 0.4
 
 /** Cuts a wide part into pieces at the wide empty gaps between columns of cells. */
 function splitColumns(part: Part, ink: Uint16Array, columns: number): Part[] {
@@ -502,7 +504,7 @@ export function analyseScreen(data: Uint8ClampedArray, width: number, height: nu
         // Rows of letters (not yet the blocks they make up); a part that is tall enough to be several rows is cut into them first
         const candidates = found.parts
             .flatMap(part => (part.y1 - part.y0) * CELL > SPLIT_HEIGHT * height ? splitRows(part, found.ink, found.columns) : [part])
-            .flatMap(part => (part.x1 - part.x0) * CELL > MAX_BLOCK_WIDTH * width ? splitColumns(part, found.ink, found.columns) : [part])
+            .flatMap(part => (part.x1 - part.x0) * CELL > SPLIT_WIDTH * width ? splitColumns(part, found.ink, found.columns) : [part])
         const lines = candidates.filter((part) => {
             const w = part.x1 - part.x0
             const h = part.y1 - part.y0
