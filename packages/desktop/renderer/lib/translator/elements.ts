@@ -85,6 +85,10 @@ const HIDE_CHANGED = 0.6
 const STILL_DIFF = 0.12
 const FAST_LOOK_MS = 220
 const SETTLE_LIMIT_MS = 5000
+// Only a place of text this small (fraction of the picture) can be a text that is typed: a box with a hand-drawn frame that boils is not
+const TYPING_MAX_AREA = 0.04
+// A shown text whose new readings fail is kept for this many failures in a row (a reading fails now and then; a text that has really gone is seen by its pixels)
+const KEEP_FAILURES = 3
 // An element is not read more often than this (a text that is still the same is not worth it)
 const READ_GAP_MS = 600
 const SHOWN_READ_GAP_MS = 1800
@@ -1002,7 +1006,7 @@ export default class ElementsEngine {
             if(now - element.readAt < gap){
                 continue
             }
-            if(element.changing === true && now - (element.changingSince ?? now) < SETTLE_LIMIT_MS){
+            if(element.changing === true && element.rect.w * element.rect.h < TYPING_MAX_AREA && now - (element.changingSince ?? now) < SETTLE_LIMIT_MS){
                 continue
             }
 
@@ -1122,8 +1126,14 @@ export default class ElementsEngine {
 
         if(result === null || result.segments.length === 0){
             // Nothing readable: a false alarm (a picture, a decoration) is left alone for a while, longer every time
+            if(element.state === 'text' && element.segments.length > 0 && element.deadCount < KEEP_FAILURES){
+                // It had text before and a reading may fail now and then: the plate stays and the reading is tried again
+                element.deadCount++
+                element.dirty = true
+                element.dirtySince = Date.now()
+                return
+            }
             if(element.state === 'text' && element.deadCount === 0){
-                // It had text before and a reading may fail now and then: once more before it is given up
                 element.deadCount = 1
                 element.dirty = true
                 element.dirtySince = Date.now()
