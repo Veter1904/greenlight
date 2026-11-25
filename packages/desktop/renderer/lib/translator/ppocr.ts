@@ -25,6 +25,9 @@ const REC_MAX_WIDTH = 1280
 // ---- Words that the recognizer joined ("TAKEIT" for "TAKE IT"): an English word list splits them (the method of the wordninja package, MIT) ----
 let wordCost: Map<string, number> | null = null
 let longestWord = 0
+const SHORT_WORDS = new Set(['a', 'i', 'am', 'an', 'as', 'at', 'be', 'by', 'do', 'go', 'he', 'if', 'in', 'is', 'it', 'me', 'my', 'no', 'of', 'oh', 'ok', 'on', 'or', 'so', 'to', 'up', 'us', 'we'])
+// Words further down the list than this are rare: a split into them is not believed
+const RARE_RANK = 20000
 
 /** Gives the list of English words (the most common first, one per line); until then nothing is split. */
 export function setWordList(text: string | null): void {
@@ -78,7 +81,18 @@ function splitWords(letters: string): number[] | null {
             cuts.unshift(from[i])
         }
     }
-    return cuts.length > 0 ? cuts : null
+    if(cuts.length === 0){
+        return null
+    }
+    // A name that is not in the list falls apart into rare little words ("Ozymandias" -> "O zy mandi as"): only common words are believed
+    const bounds = [0, ...cuts, n]
+    for(let i = 0; i < bounds.length - 1; i++){
+        const piece = lower.slice(bounds[i], bounds[i + 1])
+        if((piece.length <= 2 && !SHORT_WORDS.has(piece)) || (wordCost.get(piece) ?? Infinity) > Math.log(RARE_RANK * Math.log(wordCost.size))){
+            return null
+        }
+    }
+    return cuts
 }
 
 /** How much of a reading is made of real words (0..1): a reader that mistakes letters of a pixel font reads "Obtoined o Life Copsule". Without the word list: 1. */
@@ -102,27 +116,25 @@ function plausibility(text: string): number {
     return words === 0 ? 1 : known / words
 }
 
-function splitJoinedWords(text: string): string {
+export function splitJoinedWords(text: string): string {
     if(wordCost === null){
         return text
     }
-    return text.split(' ').map((token) => {
-        const match = /^([^A-Za-z]*)([A-Za-z]+)([^A-Za-z]*)$/.exec(token)
-        if(match === null){
-            return token
-        }
-        const cuts = splitWords(match[2])
+    // A full stop or a quote that the reader did not follow with a space ("skill.Iron", "'Iron'skill"), then every long run of letters that is not a word
+    const spaced = text.replace(/([a-z])([.!?;:,])([A-Z])/g, '$1$2 $3').replace(/([a-z])'([A-Z][A-Za-z]+)'/g, "$1 '$2'").replace(/([A-Za-z]),([a-z]{2,})/g, '$1, $2').replace(/([a-z]s)'([a-z]{3,})/g, "$1' $2").replace(/'([A-Za-z]+)'(?=[A-Za-z])/g, "'$1' ")
+    return spaced.replace(/[A-Za-z]{6,40}/g, (run) => {
+        const cuts = splitWords(run)
         if(cuts === null){
-            return token
+            return run
         }
         let out = ''
         let last = 0
         for(const cut of cuts){
-            out += match[2].slice(last, cut) + ' '
+            out += run.slice(last, cut) + ' '
             last = cut
         }
-        return match[1] + out + match[2].slice(last) + match[3]
-    }).join(' ')
+        return out + run.slice(last)
+    })
 }
 
 export function ppocrReady(): boolean {
@@ -296,6 +308,8 @@ export async function ppocrRecognize(canvas: any): Promise<OcrResult> {
     const boxes = (await detect(rgba, width, height)).sort((a, b) => (a.y + a.h / 2) - (b.y + b.h / 2) || a.x - b.x)
     const lines: OcrLine[] = []
     for(const box of boxes){
+        // The recognizer runs in the thread of the engine: between two lines the engine may look at the picture (a plate that is stale is taken away without waiting for the whole text)
+        await new Promise<void>(resolve => setTimeout(resolve, 0))
         const read = await recognizeBox(rgba, width, height, box)
         if(read === null || read.text.trim() === ''){
             continue

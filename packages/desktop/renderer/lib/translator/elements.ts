@@ -616,6 +616,8 @@ export default class ElementsEngine {
     _watchTimer: ReturnType<typeof setTimeout> | undefined
     _watchCanvas: HTMLCanvasElement | null = null
     _scanning = false
+    // How many looks were made (for the performance report)
+    _scans = 0
     _detected: Array<{ x: number; y: number; w: number; h: number; polarity: Polarity }> = []
     _detectedAt = 0
     _detectMs = 0
@@ -880,6 +882,7 @@ export default class ElementsEngine {
 
         const began = Date.now()
         this._scanning = true
+        this._scans++
         try {
             await this._scanOnce()
         } catch(error) {
@@ -1208,7 +1211,9 @@ export default class ElementsEngine {
                     const mask = this._masks[this._polarities.indexOf(element.polarity)]
                     if(mask !== undefined){
                         const current = cellsOf(mask.mask, width, height, element.scan)
-                        if(current.sum < element.sigSum * 0.5 || coreDifference(element.sig, current.cells) > 0.7){
+                        const difference = coreDifference(element.sig, current.cells)
+                        // Not found where it was and the letters there are not its letters: it is gone (a look that comes seldom must not leave a stale plate for several looks)
+                        if(current.sum < element.sigSum * 0.5 || difference > 0.55 || (element.missed >= 2 && difference > 0.4)){
                             this._park(element)
                             element.segments = []
                             element.state = 'idle'
@@ -1749,6 +1754,15 @@ export default class ElementsEngine {
         if(result !== null && element.detected === true){
             const letters = result.segments.reduce((sum, segment) => sum + (segment.text.match(LETTER) || []).length, 0)
             if(letters < 5 && glossaryTranslation(result.segments.map(segment => segment.text).join(' '), this._options.getSettings().source, 'uk') === null){
+                result = null
+            }
+        }
+
+        // Short words only ("and i as") from a place that only the detector found: the pattern of an ornament, not a sentence
+        if(result !== null && element.detected === true){
+            const words = result.segments.flatMap(segment => segment.text.split(/\s+/)).filter(word => /\p{L}/u.test(word))
+            const letters = result.segments.reduce((sum, segment) => sum + (segment.text.match(LETTER) || []).length, 0)
+            if(words.length >= 3 && words.every(word => word.replace(/[^\p{L}]/gu, '').length <= 3) && letters < 10){
                 result = null
             }
         }
