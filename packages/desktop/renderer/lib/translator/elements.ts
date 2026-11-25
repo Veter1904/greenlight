@@ -97,6 +97,9 @@ const KEEP_FAILURES = 3
 const DETECT_GAP_MS = 2500
 const DETECT_MAX_GAP_MS = 12000
 const DETECT_CHANGE = 6
+// Lines of text that stand one under the other with the same left edge, the same height and a small gap are one paragraph: they are read and translated together
+const PARAGRAPH_GAP = 0.7
+const PARAGRAPH_MAX_LINES = 14
 // An element is not read more often than this (a text that is still the same is not worth it)
 const READ_GAP_MS = 600
 const SHOWN_READ_GAP_MS = 1800
@@ -394,6 +397,38 @@ export default class ElementsEngine {
      * Looks at the picture: in the worker when there is one (the page does not stop for it), otherwise here. The pixels go to
      * the worker without being copied and the text pixels come back the same way.
      */
+    /** The boxes of lines that make a paragraph (same left edge, same height, a small gap between) become one box. */
+    _joinParagraphs(boxes: Array<{ x: number; y: number; w: number; h: number }>): Array<{ x: number; y: number; w: number; h: number }> {
+        const sorted = boxes.slice().sort((a, b) => a.y - b.y || a.x - b.x)
+        const groups: Array<{ x: number; y: number; w: number; h: number; lines: number; lastH: number; lastX: number }> = []
+        for(const box of sorted){
+            const group = groups.find((g) => {
+                if(g.lines >= PARAGRAPH_MAX_LINES){
+                    return false
+                }
+                const bottom = g.y + g.h
+                const gap = box.y - bottom
+                const similar = box.h > g.lastH * 0.6 && box.h < g.lastH * 1.6
+                const sameEdge = Math.abs(box.x - g.lastX) <= Math.max(g.lastH, box.h) * 1.5 || (box.x < g.x + g.w && box.x + box.w > g.x && Math.abs(box.x - g.x) <= Math.max(g.lastH, box.h) * 4)
+                return similar && sameEdge && gap >= -box.h * 0.3 && gap <= Math.max(g.lastH, box.h) * PARAGRAPH_GAP
+            })
+            if(group === undefined){
+                groups.push({ ...box, lines: 1, lastH: box.h, lastX: box.x })
+            } else {
+                const right = Math.max(group.x + group.w, box.x + box.w)
+                const bottom = Math.max(group.y + group.h, box.y + box.h)
+                group.x = Math.min(group.x, box.x)
+                group.y = Math.min(group.y, box.y)
+                group.w = right - group.x
+                group.h = bottom - group.y
+                group.lines++
+                group.lastH = box.h
+                group.lastX = box.x
+            }
+        }
+        return groups.map((g) => ({ x: g.x, y: g.y, w: g.w, h: g.h }))
+    }
+
     /** The places of text the detector finds (fractions of the picture), taken again when the picture has changed. */
     async _detectBlocks(pixels: Uint8ClampedArray, width: number, height: number): Promise<Array<{ x: number; y: number; w: number; h: number; polarity: Polarity }>> {
         const now = Date.now()
@@ -423,7 +458,7 @@ export default class ElementsEngine {
         const detectStarted = Date.now()
         const boxes = await ppocrDetectBoxes(pixels, width, height)
         this._detectMs += Date.now() - detectStarted
-        this._detected = boxes.slice(0, MAX_BLOCKS).map((box) => {
+        this._detected = this._joinParagraphs(boxes).slice(0, MAX_BLOCKS).map((box) => {
             // The letters are the smaller part of the box: bright ones on a dark ground, or dark ones on a light ground
             const x0 = Math.max(0, Math.floor(box.x))
             const y0 = Math.max(0, Math.floor(box.y))
