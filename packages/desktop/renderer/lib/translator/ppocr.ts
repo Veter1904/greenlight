@@ -138,7 +138,125 @@ export function splitJoinedWords(text: string): string {
 }
 
 export function ppocrReady(): boolean {
-    return det !== null && rec !== null
+    return (det !== null && rec !== null) || remoteReady
+}
+
+// ---- The reader in a worker of its own ----
+// The models run in WebAssembly, in the thread that calls them: a reading of a paragraph keeps that thread busy for a second or two, and a worker that reads cannot look at the
+// picture meanwhile (a plate that is stale stays). So the models can live in a second worker: `serveReader` runs there, `useRemoteReader` connects the engine to it by a channel.
+let remote: MessagePort | null = null
+let remoteReady = false
+let remoteId = 0
+let remoteFailures = 0
+let remoteOnFailed: (() => void) | null = null
+const remoteWaiting = new Map<number, (answer: any) => void>()
+// The longest an answer may take (a reading is 1-3 s on the Deck, the models are loaded once)
+let REMOTE_TIMEOUT_MS = 20000
+const REMOTE_MAX_FAILURES = 3
+export const remoteStats = { calls: 0, failures: 0 }
+/** For tests: how long an answer may take. */
+export function setRemoteTimeout(ms: number): void {
+    REMOTE_TIMEOUT_MS = ms
+}
+
+/** The engine side: the reader is in the worker at the other end of the port. `onReady` is called when it has its models, `onFailed` when it does not answer (the caller reads itself then). */
+export function useRemoteReader(port: MessagePort, onReady: () => void, onFailed: () => void): void {
+    remote = port
+    remoteReady = false
+    remoteFailures = 0
+    remoteOnFailed = onFailed
+    port.onmessage = (event: MessageEvent) => {
+        const answer = event.data
+        if(answer.type === 'ready'){
+            remoteReady = true
+            onReady()
+        } else if(answer.type === 'failed'){
+            giveUpRemote()
+        } else if(answer.id !== undefined){
+            const done = remoteWaiting.get(answer.id)
+            if(done !== undefined){
+                remoteWaiting.delete(answer.id)
+                done(answer)
+            }
+        }
+    }
+}
+
+/** The reader of the other worker is given up (it did not come up in time): `onFailed` is called, and the caller reads itself. */
+export function abandonRemoteReader(): void {
+    giveUpRemote()
+}
+
+function giveUpRemote(): void {
+    if(remote === null){
+        return
+    }
+    remoteReady = false
+    remote = null
+    for(const done of Array.from(remoteWaiting.values())){
+        done(null)
+    }
+    remoteWaiting.clear()
+    const callback = remoteOnFailed
+    remoteOnFailed = null
+    callback?.()
+}
+
+function askRemote(message: any, transfer: Transferable[]): Promise<any | null> {
+    const port = remote
+    if(port === null || !remoteReady){
+        return Promise.resolve(null)
+    }
+    remoteStats.calls++
+    return new Promise((resolve) => {
+        const id = ++remoteId
+        const timer = setTimeout(() => {
+            remoteWaiting.delete(id)
+            remoteStats.failures++
+            remoteFailures++
+            if(remoteFailures >= REMOTE_MAX_FAILURES){
+                giveUpRemote()
+            }
+            resolve(null)
+        }, REMOTE_TIMEOUT_MS)
+        remoteWaiting.set(id, (answer: any) => {
+            clearTimeout(timer)
+            if(answer !== null && answer.error === undefined){
+                remoteFailures = 0
+            }
+            resolve(answer !== null && answer.error === undefined ? answer : null)
+        })
+        try {
+            port.postMessage({ ...message, id }, transfer)
+        } catch(error) {
+            clearTimeout(timer)
+            remoteWaiting.delete(id)
+            resolve(null)
+        }
+    })
+}
+
+/** The reader side: answers the requests that come through the port, one at a time (the models are used by one call at a time). */
+export function serveReader(port: MessagePort): void {
+    let queue: Promise<void> = Promise.resolve()
+    port.onmessage = (event: MessageEvent) => {
+        const m = event.data
+        queue = queue.then(async () => {
+            try {
+                const rgba = new Uint8ClampedArray(m.buf)
+                const started = Date.now()
+                if(m.op === 'detect'){
+                    const boxes = await detect(rgba, m.w, m.h)
+                    port.postMessage({ id: m.id, boxes, ms: Date.now() - started })
+                } else if(m.op === 'read'){
+                    const result = await recognizeLocal(rgba, m.w, m.h)
+                    port.postMessage({ id: m.id, result, ms: Date.now() - started })
+                }
+            } catch(error) {
+                port.postMessage({ id: m.id, error: String(error) })
+            }
+        })
+    }
 }
 
 /** Starts the reader. `detModel` / `recModel` are the ONNX files (bytes or a path the runtime can open), `keysText` the dictionary of the recognizer. */
@@ -289,6 +407,17 @@ export async function ppocrDetectBoxes(rgba: Uint8ClampedArray, width: number, h
         return []
     }
     const started = Date.now()
+    if(remote !== null){
+        // The picture is copied (the engine keeps using its own) and given to the other worker
+        const copy = rgba.slice()
+        const answer = await askRemote({ op: 'detect', w: width, h: height, buf: copy.buffer }, [copy.buffer])
+        if(answer === null){
+            return []
+        }
+        ppocrStats.detects++
+        ppocrStats.detectMs += answer.ms
+        return answer.boxes
+    }
     const boxes = await detect(rgba, width, height)
     ppocrStats.detects++
     ppocrStats.detectMs += Date.now() - started
@@ -297,7 +426,6 @@ export async function ppocrDetectBoxes(rgba: Uint8ClampedArray, width: number, h
 
 /** Reads the lines of text of a picture (a canvas): the lines come in the order of reading, with their boxes in pixels of the picture. */
 export async function ppocrRecognize(canvas: any): Promise<OcrResult> {
-    const started = Date.now()
     const width: number = canvas.width
     const height: number = canvas.height
     const context = canvas.getContext('2d')
@@ -305,10 +433,28 @@ export async function ppocrRecognize(canvas: any): Promise<OcrResult> {
         return { text: '', confidence: 0, lines: [] }
     }
     const rgba: Uint8ClampedArray = context.getImageData(0, 0, width, height).data
+    if(remote !== null){
+        const answer = await askRemote({ op: 'read', w: width, h: height, buf: rgba.buffer }, [rgba.buffer])
+        if(answer === null){
+            return { text: '', confidence: 0, lines: [] }
+        }
+        ppocrStats.reads++
+        ppocrStats.ms += answer.ms
+        return answer.result
+    }
+    const started = Date.now()
+    const result = await recognizeLocal(rgba, width, height)
+    ppocrStats.reads++
+    ppocrStats.ms += Date.now() - started
+    return result
+}
+
+/** The reading itself, with the models of this thread. */
+async function recognizeLocal(rgba: Uint8ClampedArray, width: number, height: number): Promise<OcrResult> {
     const boxes = (await detect(rgba, width, height)).sort((a, b) => (a.y + a.h / 2) - (b.y + b.h / 2) || a.x - b.x)
     const lines: OcrLine[] = []
     for(const box of boxes){
-        // The recognizer runs in the thread of the engine: between two lines the engine may look at the picture (a plate that is stale is taken away without waiting for the whole text)
+        // The recognizer runs in the thread of this worker: between two lines it may do something else (answer, look at the picture)
         await new Promise<void>(resolve => setTimeout(resolve, 0))
         const read = await recognizeBox(rgba, width, height, box)
         if(read === null || read.text.trim() === ''){
@@ -321,8 +467,6 @@ export async function ppocrRecognize(canvas: any): Promise<OcrResult> {
             wordHeight: box.h,
         })
     }
-    ppocrStats.reads++
-    ppocrStats.ms += Date.now() - started
     if(lines.length === 0){
         return { text: '', confidence: 0, lines: [] }
     }
