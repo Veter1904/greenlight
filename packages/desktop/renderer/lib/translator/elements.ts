@@ -58,7 +58,7 @@ const SCAN_FAST_MS = 70
 // A look in the worker that has not come back in this time is given up (it is made on the page then)
 const WORKER_TIMEOUT_MS = 4000
 const MAX_BLOCKS = 30
-const MAX_ELEMENTS = 48
+const MAX_ELEMENTS = 32
 
 // An element that was not found on this many looks in a row is gone (a place of text that proved to be a false alarm is
 // remembered for longer, so that it is not tried again and again)
@@ -100,7 +100,7 @@ const DETECT_MAX_GAP_MS = 12000
 // the detector is asked less often when it is slow
 const DETECT_MIN_ASPECT = 1.0
 const DETECT_MAX_BOXES = 24
-const DETECT_SLOW_FACTOR = 6
+const DETECT_SLOW_FACTOR = 10
 const DETECT_CHANGE = 6
 // Lines of text that stand one under the other with the same left edge, the same height and a small gap are one paragraph: they are read and translated together
 const PARAGRAPH_GAP = 0.7
@@ -1119,7 +1119,8 @@ export default class ElementsEngine {
         if(centralness(element.rect) > 0){
             need = Math.min(need, 2)
         }
-        return need + (element.polarity === 'dark' ? 1 : 0)
+        // A picture with very many pieces of text (a busy moving background) is looked at more carefully before a piece is read: it is mostly false alarms
+        return need + (element.polarity === 'dark' ? 1 : 0) + Math.floor(this._elements.length / 14)
     }
 
     // ----------------------------------------------------------------------------------------------- reading
