@@ -1,7 +1,9 @@
 import TranslatorEngine, { EngineStatus, Polarity, TextColor, TranslatedSegment, TranslateFunction, TranslatorResult, isSameReading, normalizeText, templateKey, toTranslatable } from './engine'
+import { getReaderMode } from './ocr'
+import { ppocrDetectBoxes, ppocrReady } from './ppocr'
 import { Region, FitMode, regionToSource, videoRectToScreen } from './geometry'
 import { getOcrWorker } from './ocr'
-import { BlockRole, analyseScreen } from './scout'
+import { BlockRole, analyseScreen, classify } from './scout'
 import { inkMasksInSlices } from './ink'
 import type { AutoFrame } from './autowindows'
 
@@ -89,6 +91,11 @@ const SETTLE_LIMIT_MS = 5000
 const TYPING_MAX_AREA = 0.04
 // A shown text whose new readings fail is kept for this many failures in a row (a reading fails now and then; a text that has really gone is seen by its pixels)
 const KEEP_FAILURES = 3
+// The detector of the modern reader finds the places of text the scout misses (stylized letters, text on a busy picture). It takes some
+// time, so it looks at the picture when it has changed, and at least this often
+const DETECT_GAP_MS = 2500
+const DETECT_MAX_GAP_MS = 12000
+const DETECT_CHANGE = 6
 // An element is not read more often than this (a text that is still the same is not worth it)
 const READ_GAP_MS = 600
 const SHOWN_READ_GAP_MS = 1800
@@ -146,6 +153,7 @@ interface Element {
     state: 'new' | 'text' | 'dead' | 'idle';
     dirty: boolean;
     // A small grey fingerprint of the place of the text while it is shown (the watch between the looks), and the reading it belongs to
+    detected?: boolean;
     watchSig?: Uint8Array;
     // The signature of the last look and whether the text changed since the look before (typing); since when it has not settled
     lastCells?: Uint8Array;
@@ -339,6 +347,10 @@ export default class ElementsEngine {
     _watchTimer: ReturnType<typeof setTimeout> | undefined
     _watchCanvas: HTMLCanvasElement | null = null
     _scanning = false
+    _detected: Array<{ x: number; y: number; w: number; h: number; polarity: Polarity }> = []
+    _detectedAt = 0
+    _detectMs = 0
+    _detectThumb: Uint8Array | null = null
     _lookChanged = false
     _lastWake = 0
     _readTimer: ReturnType<typeof setTimeout> | undefined
@@ -381,6 +393,68 @@ export default class ElementsEngine {
      * Looks at the picture: in the worker when there is one (the page does not stop for it), otherwise here. The pixels go to
      * the worker without being copied and the text pixels come back the same way.
      */
+    /** The places of text the detector finds (fractions of the picture), taken again when the picture has changed. */
+    async _detectBlocks(pixels: Uint8ClampedArray, width: number, height: number): Promise<Array<{ x: number; y: number; w: number; h: number; polarity: Polarity }>> {
+        const now = Date.now()
+        // A coarse grey copy of the picture: has it changed since the detector looked?
+        const tw = 64
+        const th = 36
+        const thumb = new Uint8Array(tw * th)
+        for(let y = 0; y < th; y++){
+            for(let x = 0; x < tw; x++){
+                const o = ((Math.floor((y + 0.5) * height / th)) * width + Math.floor((x + 0.5) * width / tw)) * 4
+                thumb[y * tw + x] = (pixels[o] * 299 + pixels[o + 1] * 587 + pixels[o + 2] * 114) / 1000
+            }
+        }
+        let change = 0
+        if(this._detectThumb !== null){
+            for(let i = 0; i < thumb.length; i++){
+                change += Math.abs(thumb[i] - this._detectThumb[i])
+            }
+            change /= thumb.length
+        }
+        const due = this._detectThumb === null || now - this._detectedAt >= DETECT_MAX_GAP_MS || (change > DETECT_CHANGE && now - this._detectedAt >= DETECT_GAP_MS)
+        if(!due){
+            return this._detected
+        }
+        this._detectThumb = thumb
+        this._detectedAt = now
+        const detectStarted = Date.now()
+        const boxes = await ppocrDetectBoxes(pixels, width, height)
+        this._detectMs += Date.now() - detectStarted
+        this._detected = boxes.slice(0, MAX_BLOCKS).map((box) => {
+            // The letters are the smaller part of the box: bright ones on a dark ground, or dark ones on a light ground
+            const x0 = Math.max(0, Math.floor(box.x))
+            const y0 = Math.max(0, Math.floor(box.y))
+            const x1 = Math.min(width, Math.ceil(box.x + box.w))
+            const y1 = Math.min(height, Math.ceil(box.y + box.h))
+            let low = 255
+            let high = 0
+            for(let y = y0; y < y1; y += 2){
+                for(let x = x0; x < x1; x += 2){
+                    const o = (y * width + x) * 4
+                    const grey = (pixels[o] * 299 + pixels[o + 1] * 587 + pixels[o + 2] * 114) / 1000
+                    low = Math.min(low, grey)
+                    high = Math.max(high, grey)
+                }
+            }
+            const middle = (low + high) / 2
+            let bright = 0
+            let total = 0
+            for(let y = y0; y < y1; y += 2){
+                for(let x = x0; x < x1; x += 2){
+                    const o = (y * width + x) * 4
+                    if((pixels[o] * 299 + pixels[o + 1] * 587 + pixels[o + 2] * 114) / 1000 > middle){
+                        bright++
+                    }
+                    total++
+                }
+            }
+            return { x: box.x / width, y: box.y / height, w: box.w / width, h: box.h / height, polarity: (bright < total * 0.5 ? 'light' : 'dark') as Polarity }
+        })
+        return this._detected
+    }
+
     _analyse(pixels: Uint8ClampedArray, width: number, height: number): Promise<{ blocks: ReturnType<typeof analyseScreen>['blocks']; masks: Array<{ mask: Uint8Array; count: number }> }> {
         const worker = this._worker
         if(worker === null){
@@ -505,7 +579,9 @@ export default class ElementsEngine {
             console.warn('Translator: look failed:', error)
         }
         this._scanning = false
-        this._scanTook = Date.now() - began
+        // The time of the detector is not the time of the look: it must not make the look smaller and bigger again (everything would seem changed)
+        this._scanTook = Math.max(1, Date.now() - began - this._detectMs)
+        this._detectMs = 0
         if(this._width > SCAN_WIDTH_SMALL && this._scanTook > SCAN_SLOW_MS){
             this._width = SCAN_WIDTH_SMALL
         } else if(this._width < SCAN_WIDTH && this._scanTook < SCAN_FAST_MS){
@@ -644,7 +720,21 @@ export default class ElementsEngine {
         }
         const pixels = context.getImageData(0, 0, width, height).data
 
-        const { blocks, masks } = await this._analyse(pixels, width, height)
+        // The detector of the modern reader (when it is loaded) adds the places of text the scout did not find
+        const detected = getReaderMode() !== 'tesseract' && ppocrReady() ? await this._detectBlocks(pixels, width, height) : []
+        const analysed = await this._analyse(pixels, width, height)
+        const masks = analysed.masks
+        const blocks = analysed.blocks.slice()
+        for(const found of detected){
+            if(blocks.length >= MAX_BLOCKS){
+                break
+            }
+            const area = found.w * found.h
+            const known = blocks.some(block => inside(found, block) > 0.5 || (inside(block, found) > 0.7 && block.w * block.h > area * 0.3))
+            if(!known && area > 0){
+                blocks.push({ x: found.x, y: found.y, w: found.w, h: found.h, polarity: found.polarity, role: classify(found), score: 300, plate: false, detected: true })
+            }
+        }
         if(!this._running){
             return
         }
@@ -731,7 +821,7 @@ export default class ElementsEngine {
                 best = {
                     id: this._nextId++, rect, scan, polarity: block.polarity, role: block.role, plate: block.plate, panel, score: block.score,
                     seen: 0, missed: 0, state: 'new', dirty: false, dirtySince: now, reading: false, readAt: 0, deadUntil: 0, deadCount: 0,
-                    sig: null, sigSum: 0, segments: [],
+                    sig: null, sigSum: 0, segments: [], detected: block.detected === true,
                 }
                 this._elements.push(best)
             }
@@ -1065,7 +1155,17 @@ export default class ElementsEngine {
         // The text colour the scout found first; when nothing is read, the other one (white text on a light bar looks dark)
         // and, when that does not work, the picture in grey (thin or faint letters are lost when it is cut into black and white)
         const other: Polarity = element.polarity === 'light' ? 'dark' : 'light'
-        const attempts: Array<[Polarity, boolean | 'stretched']> = [[element.polarity, false], [other, false]]
+        const attempts: Array<[Polarity, boolean | 'stretched' | 'color']> = [[element.polarity, false], [other, false]]
+        // The modern reader looks at the natural picture first
+        if(getReaderMode() !== 'tesseract' && ppocrReady()){
+            // The modern reader looks once at the natural picture; for a place the scout found the black-and-white way of Tesseract is tried after it
+            // (the other ways, with the other polarity and in grey, cost much time and are left to the classic reader)
+            attempts.length = 0
+            attempts.push([element.polarity, 'color'])
+            if(element.detected !== true){
+                attempts.push([element.polarity, false])
+            }
+        }
         if(element.score >= RAW_MIN_SCORE){
             attempts.push([element.polarity, true], [element.polarity, 'stretched'])
         }

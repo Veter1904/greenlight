@@ -25,6 +25,8 @@ export interface TextBlock {
     // The panel of the interface the text sits on (fractions of the picture), when its edges were found
     panel?: { x: number; y: number; w: number; h: number };
     stats?: { fill: number; ratio: number; onShare: number };
+    // Found by the detector of the modern reader (not by the scout): it is read in its natural colours, in one go
+    detected?: boolean;
 }
 
 // The picture is looked at in cells of CELL x CELL pixels: a cell is "on" when it holds some text-coloured ink

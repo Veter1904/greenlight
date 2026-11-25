@@ -1,4 +1,5 @@
 import type { Worker } from 'tesseract.js'
+import { ppocrReady, ppocrRecognize } from './ppocr'
 
 // The OCR engine (Tesseract compiled to WebAssembly) and the English language data are bundled with the app
 // (renderer/public/tesseract), so reading English works offline. The language data of any other language
@@ -156,7 +157,21 @@ function releaseReader() {
 // with text of different sizes in different places (the whole screen). Set again only when it changes.
 let currentLayout: 'block' | 'page' | null = null
 
-export async function recognizeCanvas(canvas: HTMLCanvasElement, language = 'en', priority = 1, maxGap = MAX_WORD_GAP, layout: 'block' | 'page' = 'block'): Promise<OcrResult> {
+// Which reader looks at a picture: Tesseract, PP-OCR (when it is loaded), or PP-OCR first and Tesseract for what it did not read
+export type ReaderMode = 'tesseract' | 'ppocr' | 'both'
+let readerMode: ReaderMode = 'tesseract'
+export function getReaderMode(): ReaderMode {
+    return readerMode
+}
+export function setReaderMode(mode: ReaderMode) {
+    readerMode = mode
+}
+
+export async function recognizeCanvas(canvas: HTMLCanvasElement, language = 'en', priority = 1, maxGap = MAX_WORD_GAP, layout: 'block' | 'page' = 'block', natural = false): Promise<OcrResult> {
+    // The modern reader reads the pictures in their natural colours; the black-and-white and grey ones are for Tesseract
+    if(readerMode !== 'tesseract' && ppocrReady() && (natural || readerMode === 'ppocr')){
+        return ppocrRecognize(canvas)
+    }
     await acquireReader(priority)
     // The reader that is shut down while this reading goes on is not used any more (see aborted)
     const mine = aborted

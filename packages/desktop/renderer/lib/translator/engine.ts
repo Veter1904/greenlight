@@ -1916,7 +1916,7 @@ export default class TranslatorEngine {
     }
 
     /** Reads the window with one text colour and turns the result into pieces of text with their position and colours. */
-    async _read(job: Snapshot, polarity: Polarity, raw: boolean | 'stretched' = false): Promise<ReadResult | null> {
+    async _read(job: Snapshot, polarity: Polarity, raw: boolean | 'stretched' | 'color' = false): Promise<ReadResult | null> {
         const source = job.source
         const prepared = await this._prepareForReading(job.canvas, source, polarity, raw)
         if(prepared === null){
@@ -1934,7 +1934,7 @@ export default class TranslatorEngine {
             }
         }
 
-        const result = await recognizeCanvas(prepared.canvas, job.config.source, this._options.priority ?? 1, job.config.mode === 'task' ? TASK_WORD_GAP : DIALOG_WORD_GAP, job.config.fullScreen === true ? 'page' : 'block')
+        const result = await recognizeCanvas(prepared.canvas, job.config.source, this._options.priority ?? 1, job.config.mode === 'task' ? TASK_WORD_GAP : DIALOG_WORD_GAP, job.config.fullScreen === true ? 'page' : 'block', raw === 'color')
         if(result.confidence < MIN_CONFIDENCE){
             return null
         }
@@ -2128,7 +2128,7 @@ export default class TranslatorEngine {
     }
 
     /** Crops the window from the video and turns it into black text on white, which is what the text reader likes. */
-    async _prepareForReading(frame: HTMLCanvasElement, source: SourceRect, polarity: Polarity, raw: boolean | 'stretched' = false): Promise<PreparedImage | null> {
+    async _prepareForReading(frame: HTMLCanvasElement, source: SourceRect, polarity: Polarity, raw: boolean | 'stretched' | 'color' = false): Promise<PreparedImage | null> {
         // Small interface text needs to be enlarged a lot to be read reliably
         let scale = Math.min(3, Math.max(2, 1300 / source.sw))
         // A single row of big letters is enlarged less (the reader needs letters of about this height, and the time grows with the pixels)
@@ -2174,6 +2174,11 @@ export default class TranslatorEngine {
                 data[i * 4] = value
                 data[i * 4 + 1] = value
                 data[i * 4 + 2] = value
+                data[i * 4 + 3] = 255
+            }
+        } else if(raw === 'color'){
+            // The picture as it is, in its colours (the reader of the modern kind, PP-OCR, does best on the natural picture)
+            for(let i = 0; i < ink.length; i++){
                 data[i * 4 + 3] = 255
             }
         } else if(raw === 'stretched'){
