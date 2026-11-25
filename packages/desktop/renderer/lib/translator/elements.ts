@@ -2,6 +2,7 @@ import TranslatorEngine, { EngineStatus, Polarity, TextColor, TranslatedSegment,
 import { Region, FitMode, regionToSource, videoRectToScreen } from './geometry'
 import { getOcrWorker } from './ocr'
 import { BlockRole, analyseScreen } from './scout'
+import { inkMasksInSlices } from './ink'
 import type { AutoFrame } from './autowindows'
 
 /**
@@ -61,6 +62,8 @@ const DEAD_DROP_MISSES = 12
 // CHANGED and the element is read again; when less than GONE of the ink that was read is left, the text is gone
 const CHANGED = 0.3
 const GONE = 0.2
+// A picture of the game that was taken another way (see verifyAgainst) differs a little from the live one even where nothing changed
+const VERIFY_CHANGED = 0.68
 // An element that had nothing to read stays "dead" for this long, unless its pixels change a lot
 const DEAD_MS = 20000
 const REVIVE_CHANGE = 0.55
@@ -128,12 +131,16 @@ interface Element {
     // The text pixels when it was read (cells), and how much ink there was
     sig: Uint8Array | null;
     sigSum: number;
+    sigGrid?: { gx: number; gy: number };
     segments: Segment[];
 }
 
 interface Cells {
     cells: Uint8Array;
     sum: number;
+    // The size of the grid of cells (a picture of another size is compared on the same grid)
+    gx: number;
+    gy: number;
 }
 
 // How much of the first box lies inside the second one (0..1)
@@ -248,18 +255,18 @@ function plateColors(base: [number, number, number], ink: [number, number, numbe
 }
 
 /** The text pixels of a place as a coarse grid: how much of every cell is text (0..255). */
-function cellsOf(mask: Uint8Array, width: number, height: number, box: Region): Cells {
+function cellsOf(mask: Uint8Array, width: number, height: number, box: Region, grid?: { gx: number; gy: number }): Cells {
     const x0 = Math.max(0, Math.floor(box.x * width))
     const y0 = Math.max(0, Math.floor(box.y * height))
     const x1 = Math.min(width, Math.ceil((box.x + box.w) * width))
     const y1 = Math.min(height, Math.ceil((box.y + box.h) * height))
-    const gx = Math.max(6, Math.min(64, Math.round((x1 - x0) / 3)))
-    const gy = Math.max(3, Math.min(24, Math.round((y1 - y0) / 3)))
+    const gx = grid === undefined ? Math.max(6, Math.min(64, Math.round((x1 - x0) / 3))) : grid.gx
+    const gy = grid === undefined ? Math.max(3, Math.min(24, Math.round((y1 - y0) / 3))) : grid.gy
     const cells = new Uint8Array(gx * gy)
     let sum = 0
 
     if(x1 <= x0 || y1 <= y0){
-        return { cells, sum }
+        return { cells, sum, gx, gy }
     }
 
     const counts = new Uint16Array(gx * gy)
@@ -278,7 +285,7 @@ function cellsOf(mask: Uint8Array, width: number, height: number, box: Region): 
         cells[i] = totals[i] === 0 ? 0 : Math.round(255 * counts[i] / totals[i])
         sum += cells[i]
     }
-    return { cells, sum }
+    return { cells, sum, gx, gy }
 }
 
 /** How different two grids are: 0 the same, 1 nothing in common. */
@@ -627,6 +634,42 @@ export default class ElementsEngine {
         this._report()
     }
 
+    /**
+     * A picture of the game without the plates (taken another way, so its pixels are not the same as those of the live picture: it must
+     * not replace them, or everything looks changed). It only answers one question: is the text under a plate still the same? An element
+     * whose text pixels differ a lot from what was read is read again.
+     */
+    async verifyAgainst(pixels: Uint8ClampedArray, width: number, height: number): Promise<{ checked: number; changed: number; differences: number[] }> {
+        const result = { checked: 0, changed: 0, differences: [] as number[] }
+        if(!this._running){
+            return result
+        }
+        const masks = await inkMasksInSlices(pixels, width, height, this._polarities, () => new Promise<void>(resolve => setTimeout(resolve, 0)))
+        if(!this._running){
+            return result
+        }
+        const now = Date.now()
+        for(const element of this._elements){
+            if(element.state !== 'text' || element.sig === null || element.sigGrid === undefined || element.reading || element.dirty){
+                continue
+            }
+            const mask = masks[this._polarities.indexOf(element.polarity)]
+            if(mask === undefined){
+                continue
+            }
+            const current = cellsOf(mask.mask, width, height, element.scan, element.sigGrid)
+            const difference = cellsDifference(element.sig, current.cells)
+            result.checked++
+            result.differences.push(Math.round(difference * 100) / 100)
+            if(difference > VERIFY_CHANGED || current.sum < element.sigSum * 0.35){
+                element.dirty = true
+                element.dirtySince = now
+                result.changed++
+            }
+        }
+        return result
+    }
+
     /** Is there nothing between two pieces of text (no frame of a button, no icon)? Only then they can be one title. */
     _gapIsEmpty(a: { x: number; y: number; w: number; h: number; polarity: Polarity; score: number }, b: { x: number; y: number; w: number; h: number; polarity: Polarity; score: number }): boolean {
         const left = a.x <= b.x ? a : b
@@ -903,6 +946,7 @@ export default class ElementsEngine {
         if(current !== null){
             element.sig = current.cells
             element.sigSum = current.sum
+            element.sigGrid = { gx: current.gx, gy: current.gy }
         }
 
         // A few letters that the reader is not sure about are the pattern of an icon (a button of the pad, a symbol), not a word
