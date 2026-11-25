@@ -33,6 +33,9 @@ export interface ElementsOptions {
     // The part of the time the reader may work (0.25 = a quarter): after a reading the engine waits so that it does not take more.
     // Without it (or 1) the reader works as long as there is something to read.
     readDuty?: () => number;
+    // How fast the engine reacts: 1 = as it was made for a video (a look every 0.7 s, a shown text read again after 1.8 s); less is faster
+    // (0.5 = twice as fast). A device that sends only a few pictures a second, and wants new text on screen quickly, asks for less.
+    speed?: () => number;
 }
 
 export interface ElementResult {
@@ -475,7 +478,8 @@ export default class ElementsEngine {
         }
 
         if(this._running){
-            this._timer = setTimeout(() => this._scan(), Math.max(SCAN_MS, this._scanTook * 8))
+            const speed = this._options.speed?.() ?? 1
+            this._timer = setTimeout(() => this._scan(), Math.max(SCAN_MS * speed, this._scanTook * 8 * Math.max(0.5, speed)))
         }
     }
 
@@ -854,7 +858,7 @@ export default class ElementsEngine {
             if(!element.dirty || element.reading || element.missed > 0){
                 continue
             }
-            const gap = element.state === 'text' ? SHOWN_READ_GAP_MS : READ_GAP_MS
+            const gap = (element.state === 'text' ? SHOWN_READ_GAP_MS : READ_GAP_MS) * (this._options.speed?.() ?? 1)
             if(now - element.readAt < gap){
                 continue
             }
