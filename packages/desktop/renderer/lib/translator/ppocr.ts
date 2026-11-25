@@ -17,7 +17,11 @@ export const ppocrStats = { reads: 0, ms: 0, detects: 0, detectMs: 0 }
 // How the maps of the detector are turned into boxes
 const DET_THRESHOLD = 0.3
 const DET_BOX_SCORE = 0.55
-const DET_MAX_SIDE = 960
+let DET_MAX_SIDE = 1280
+/** The longest side the detector looks at (a bigger picture is shrunk to it): small text is found more surely in a bigger one, which takes longer. */
+export function setDetMaxSide(pixels: number): void {
+    DET_MAX_SIDE = pixels
+}
 const DET_UNCLIP = 1.6
 const REC_HEIGHT = 48
 const REC_MAX_WIDTH = 1280
@@ -129,11 +133,39 @@ const COMMON_RANK = 30000
 
 /** A word that is not a word but is one confused letter away from a common word is that word; null when it is a word, a name, or nothing is near. */
 function nearWord(token: string): string | null {
-    if(wordCost === null || token.length < 4 || token.length > 14){
+    if(wordCost === null || token.length < 3 || token.length > 14){
+        return null
+    }
+    if(token.length === 3 && !(token[0] === 'I' && /^[il][a-z]{2}$/.test(token.toLowerCase()))){
         return null
     }
     const lower = token.toLowerCase()
     const limit = Math.log(COMMON_RANK * Math.log(wordCost.size))
+    // A small l that the reader took for a capital I, and the letter after it lost ("Ist" for "list"): when the word as it was read is rare and the other one is common
+    if(token[0] === 'I' && /^[il][a-z]{2,6}$/.test(lower)){
+        const own = wordCost.get(lower)
+        const common = Math.log(10000 * Math.log(wordCost.size))
+        if(own === undefined || own > common){
+            let found: string | null = null
+            let foundCost = Math.log(8000 * Math.log(wordCost.size))
+            // the lost letter is most likely another straight stroke: an i ("Ist" is "list", not "last")
+            const withI = wordCost.get('li' + lower.slice(1))
+            if(withI !== undefined && withI < foundCost){
+                return 'li' + lower.slice(1)
+            }
+            for(const vowel of ['', 'a', 'e', 'o', 'u']){
+                const candidate = 'l' + vowel + lower.slice(1)
+                const cost = wordCost.get(candidate)
+                if(cost !== undefined && cost < foundCost){
+                    found = candidate
+                    foundCost = cost
+                }
+            }
+            if(found !== null){
+                return found
+            }
+        }
+    }
     if(wordCost.has(lower) || wordCost.has(lower.replace(/s$/, '')) || wordCost.has(lower.replace(/(ed|ing|ly)$/, ''))){
         return null
     }
@@ -165,7 +197,7 @@ export function fixNearWords(text: string): string {
     if(wordCost === null){
         return text
     }
-    return text.replace(/[A-Za-z]{4,14}/g, (word, offset: number) => (offset > 0 && text[offset - 1] === "'") ? word : (nearWord(word) ?? word))
+    return text.replace(/[A-Za-z]{3,14}/g, (word, offset: number) => (offset > 0 && text[offset - 1] === "'") ? word : (nearWord(word) ?? word))
 }
 
 export function splitJoinedWords(text: string): string {
@@ -187,6 +219,11 @@ export function splitJoinedWords(text: string): string {
         }
         return out + run.slice(last)
     })
+}
+
+/** Are the models in a worker of their own (a detection then does not stop the engine from looking at the picture)? */
+export function ppocrRemote(): boolean {
+    return remote !== null && remoteReady
 }
 
 export function ppocrReady(): boolean {

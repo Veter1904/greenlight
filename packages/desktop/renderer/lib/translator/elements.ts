@@ -1,6 +1,6 @@
 import TranslatorEngine, { EngineStatus, Polarity, TextColor, TranslatedSegment, TranslateFunction, TranslatorResult, isSameReading, normalizeText, templateKey, toTranslatable } from './engine'
 import { getReaderMode } from './ocr'
-import { ppocrDetectBoxes, ppocrReady } from './ppocr'
+import { ppocrDetectBoxes, ppocrReady, ppocrRemote } from './ppocr'
 import { Region, FitMode, regionToSource, videoRectToScreen } from './geometry'
 import { getOcrWorker } from './ocr'
 import { BlockRole, analyseScreen, classify } from './scout'
@@ -101,6 +101,8 @@ const DETECT_MAX_GAP_MS = 12000
 const DETECT_MIN_ASPECT = 1.0
 const DETECT_MAX_BOXES = 24
 const DETECT_SLOW_FACTOR = 10
+// ... when the detector runs in a worker of its own the engine keeps looking meanwhile, so it may run more often
+const DETECT_SLOW_FACTOR_REMOTE = 4
 const DETECT_CHANGE = 6
 // Lines of text that stand one under the other with the same left edge, the same height and a small gap are one paragraph: they are read and translated together
 const PARAGRAPH_GAP = 0.7
@@ -119,7 +121,9 @@ const SCROLL_PATCH = 0.5
 // A line that is cut by the edge of its window: the visible part is between these shares of the whole line, and the letters in it must lie on the same part of the whole
 const CLIP_MIN = 0.25
 const CLIP_MAX = 0.8
-const CLIP_PATCH = 0.55
+const CLIP_PATCH = 0.7
+// A line that an edge cuts is as wide as the whole line (only its height is cut): another text that starts the same way is not it
+const CLIP_WIDTH = 0.15
 // The fastest a text may scroll (screens per second) for the speed to be believed
 const MOTION_MAX = 1.5
 // A piece of text that is much smaller than the lines next to it is the end of a line that is cut by an edge: it waits longer (more looks) before it is read
@@ -719,7 +723,7 @@ export default class ElementsEngine {
             }
             change /= thumb.length
         }
-        const due = this._detectThumb === null || now - this._detectedAt >= DETECT_MAX_GAP_MS || (change > DETECT_CHANGE && now - this._detectedAt >= Math.max(DETECT_GAP_MS, this._lastDetectMs * DETECT_SLOW_FACTOR))
+        const due = this._detectThumb === null || now - this._detectedAt >= DETECT_MAX_GAP_MS || (change > DETECT_CHANGE && now - this._detectedAt >= Math.max(DETECT_GAP_MS, this._lastDetectMs * (ppocrRemote() ? DETECT_SLOW_FACTOR_REMOTE : DETECT_SLOW_FACTOR)))
         if(!due){
             return this._detected
         }
@@ -1271,10 +1275,16 @@ export default class ElementsEngine {
             if(extent === null || element.sigPatch === undefined){
                 return false
             }
+            // An edge cuts a line only while the text moves: a smaller piece on a still screen is another way of looking at the same place (the box that was read held a bit of the
+            // line next to it), not a cut
+            const moving = element.motion !== undefined && Date.now() - element.motion.at < 2000
+            if(!moving && Math.abs(rect.y - element.rect.y) <= element.rect.h * 0.5){
+                return false
+            }
             const whole = element.sigPatch.bottom - element.sigPatch.top + 1
             const seen = extent.bottom - extent.top + 1
             const across = element.sigPatch.right - element.sigPatch.left + 1
-            return seen < whole * CLIP_MAX && seen > whole * CLIP_MIN && extent.right - extent.left + 1 > across * 0.5 && extent.right - extent.left + 1 < across * 1.3
+            return seen < whole * CLIP_MAX && seen > whole * CLIP_MIN && extent.right - extent.left + 1 > across * (1 - CLIP_WIDTH) && extent.right - extent.left + 1 < across * (1 + CLIP_WIDTH)
         }
 
         // The element that is at this place already and is the same text: nothing moved
