@@ -1,6 +1,6 @@
 import TranslatorEngine, { EngineStatus, Polarity, TextColor, TranslatedSegment, TranslateFunction, TranslatorResult, isSameReading, normalizeText, templateKey, toTranslatable } from './engine'
 import { getReaderMode } from './ocr'
-import { ppocrDetectBoxes, ppocrReady, ppocrRemote, ppocrRemoteCount } from './ppocr'
+import { ppocrDetectBoxes, ppocrReady, ppocrRemote, ppocrRemoteCount, wordPlausibility } from './ppocr'
 import { Region, FitMode, regionToSource, videoRectToScreen } from './geometry'
 import { getOcrWorker } from './ocr'
 import { BlockRole, analyseScreen, classify } from './scout'
@@ -41,6 +41,8 @@ export interface ElementsOptions {
     speed?: () => number;
     // How many readings may go on at the same time (1 when this is not given): the readers that are in workers of their own can read two places at once
     readConcurrency?: () => number;
+    // Where the plates of the plugin are on the screen (fractions of the picture), when the picture holds them (the frames of the screen): a new piece of text found inside a plate is the plate itself
+    getPlateRects?: () => Region[];
 }
 
 export interface ElementResult {
@@ -136,11 +138,24 @@ const SCROLL_MAX_DX = 0.04
 const SCROLL_MAX_DY = 0.4
 // The place of an element whose pixels differ more than this from the text it was read with is looked at for another element that matches better
 const PLACE_MISMATCH = 0.45
+// One text has one plate: a plate inside a bigger one (this share of it; the other at least this many times as big) goes when its words are (this share of them) the words of the other,
+// or when it is a broken piece (reads as few real words) of a text that is much bigger
+const COVER_INSIDE = 0.6
+const COVER_AREA_RATIO = 1.5
+const COVER_WORDS = 0.7
+const COVER_FRAGMENT_INSIDE = 0.7
+const COVER_FRAGMENT_AREA = 2.5
+const COVER_FRAGMENT_QUALITY = 0.75
+const COVER_MUTUAL_QUALITY = 0.15
+const COVER_SLIVER_QUALITY = 0.8
+const COVER_SLIVER_LETTERS = 6
+const COVER_SLIVER_COLUMN = 0.2
+const COVER_SLIVER_HEIGHT = 0.8
 // Elements that left the screen are remembered (with their translations) so that a text that scrolls back is shown at once
 const PARKED_MAX = 80
 const PARKED_MAX_AGE_MS = 120000
 // How many texts were followed when they scrolled, were put back from the memory, and were put into it (for tests)
-export const scrollStats = { moved: 0, restored: 0, parked: 0, clipped: 0, scores: [] as number[] }
+export const scrollStats = { moved: 0, restored: 0, parked: 0, clipped: 0, covered: 0, scores: [] as number[] }
 // A translation that has got a better version is replaced only while it is young
 const BETTER_MS = 4000
 // Pieces of text that are at least this tall (fractions of the screen) and not further apart than this many heights are one title
@@ -1194,6 +1209,10 @@ export default class ElementsEngine {
                 if(this._elements.length >= MAX_ELEMENTS){
                     continue
                 }
+                // What stands inside a plate that is drawn over the game is the plate (its translation, read as if it were the game's text), not a new text of the game
+                if(this._insidePlate(rect)){
+                    continue
+                }
                 best = {
                     id: this._nextId++, rect, scan, polarity: block.polarity, role: block.role, plate: block.plate, panel, score: block.score,
                     seen: 0, missed: 0, state: 'new', dirty: false, dirtySince: now, reading: false, readAt: 0, deadUntil: 0, deadCount: 0,
@@ -1233,6 +1252,11 @@ export default class ElementsEngine {
 
         this._emit()
         this._report()
+    }
+
+    _insidePlate(rect: Region): boolean {
+        const plates = this._options.getPlateRects?.()
+        return plates !== undefined && plates.some(plate => inside(rect, plate) > 0.5)
     }
 
     /** An element that has gone out of sight is remembered with its translation (a text that scrolls away and back is not read again). */
@@ -1582,6 +1606,12 @@ export default class ElementsEngine {
         }
     }
 
+    /** Is this place a sliver: much lower than the lines next to it (a line that the edge of a window cuts, the half of its letters)? */
+    _isSliver(element: Element): boolean {
+        const heights = this._elements.filter(other => other !== element && other.state === 'text' && Math.abs(other.rect.x - element.rect.x) < 0.04).map(other => other.rect.h).sort((a, b) => a - b)
+        return heights.length >= 2 && element.rect.h < heights[Math.floor(heights.length / 2)] * 0.7
+    }
+
     /** On how many looks in a row an element has to be found before it is read (a subtitle at once, the rest of the interface a little later). */
     _need(element: Element): number {
         // A line that the neural detector found is a line of text already (the scout's pieces are often false alarms and have to be seen again and again): one more look is enough
@@ -1787,6 +1817,14 @@ export default class ElementsEngine {
             const words = result.segments.flatMap(segment => segment.text.split(/\s+/)).filter(word => /\p{L}/u.test(word))
             const letters = result.segments.reduce((sum, segment) => sum + (segment.text.match(LETTER) || []).length, 0)
             if(words.length >= 3 && words.every(word => word.replace(/[^\p{L}]/gu, '').length <= 3) && letters < 10){
+                result = null
+            }
+        }
+
+        // The half of a line that an edge cuts reads as garbage ("UaLK.", "TIT"): it is believed only when it reads as words
+        if(result !== null && this._isSliver(element)){
+            const text = result.segments.map(segment => segment.text).join(' ')
+            if((text.match(LETTER) || []).length < 4 || wordPlausibility(text) < 0.6){
                 result = null
             }
         }
@@ -2005,6 +2043,59 @@ export default class ElementsEngine {
                 if(areaA > areaB || (areaA === areaB && a.item.id > b.item.id)){
                     dropped.add(a.segment)
                     break
+                }
+            }
+        }
+        // One text has one plate. A paragraph is found at several sizes (the paragraph, its lines, a piece of a line) and each is read on its own, some of the readings with
+        // words lost or broken: of two plates that lie one over the other, the part goes when the other has its words, and a broken piece inside a bigger text goes.
+        if((globalThis as any).DLT_NODEDUPE !== true){
+            const wordsOf = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, ' ').split(/\s+/).filter(word => word.length >= 3)
+            for(const a of flat){
+                if(dropped.has(a.segment)){
+                    continue
+                }
+                const areaA = a.segment.rect.w * a.segment.rect.h
+                for(const b of flat){
+                    if(a === b || dropped.has(b.segment) || dropped.has(a.segment)){
+                        continue
+                    }
+                    const areaB = b.segment.rect.w * b.segment.rect.h
+                    const share = inside(a.segment.rect, b.segment.rect)
+                    // two plates of the same size on the same text: the worse reading goes (the one with fewer words, or with fewer real words)
+                    const mutual = share > COVER_FRAGMENT_INSIDE && areaB >= areaA * 0.9
+                    if(share <= COVER_INSIDE || (areaB < areaA * COVER_AREA_RATIO && !mutual)){
+                        continue
+                    }
+                    const wordsA = wordsOf(a.segment.original)
+                    const wordsB = wordsOf(b.segment.original)
+                    const setB = new Set(wordsB)
+                    const shared = wordsA.length === 0 ? 0 : wordsA.filter(word => setB.has(word)).length / wordsA.length
+                    if(areaB < areaA * COVER_AREA_RATIO){
+                        const plausibleA = wordPlausibility(a.segment.original)
+                        const plausibleB = wordPlausibility(b.segment.original)
+                        if((shared >= COVER_WORDS && wordsB.length > wordsA.length) || plausibleA + COVER_MUTUAL_QUALITY < plausibleB || (areaB >= areaA && wordsA.length === wordsB.length && shared >= COVER_WORDS && a.segment.original.length < b.segment.original.length)){
+                            dropped.add(a.segment)
+                            scrollStats.covered++
+                        }
+                        continue
+                    }
+                    if(shared >= COVER_WORDS || (share > COVER_FRAGMENT_INSIDE && wordPlausibility(a.segment.original) + COVER_MUTUAL_QUALITY < wordPlausibility(b.segment.original)) || (share > COVER_FRAGMENT_INSIDE && areaB >= areaA * COVER_FRAGMENT_AREA && wordPlausibility(a.segment.original) < COVER_FRAGMENT_QUALITY)){
+                        dropped.add(a.segment)
+                        scrollStats.covered++
+                    }
+                }
+            }
+        }
+        // A piece that is lower than the lines of the text around it (the same part of the screen) and does not read as words, or has a few letters only, is a part of a line that was cut out wrongly
+        if((globalThis as any).DLT_NODEDUPE !== true){
+            for(const a of flat){
+                if(dropped.has(a.segment) || (wordPlausibility(a.segment.original) >= COVER_SLIVER_QUALITY && (a.segment.original.match(/\p{L}/gu) || []).length > COVER_SLIVER_LETTERS)){
+                    continue
+                }
+                const peers = flat.filter(b => b !== a && !dropped.has(b.segment) && Math.abs(b.segment.rect.y - a.segment.rect.y) < COVER_SLIVER_COLUMN && b.segment.lineHeight > 0 && wordPlausibility(b.segment.original) >= 0.9).map(b => b.segment.lineHeight).sort((x, y) => x - y)
+                if(peers.length >= 3 && Math.max(a.segment.rect.h, a.segment.lineHeight) < peers[Math.floor(peers.length / 2)] * COVER_SLIVER_HEIGHT){
+                    dropped.add(a.segment)
+                    scrollStats.covered++
                 }
             }
         }

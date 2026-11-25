@@ -1,5 +1,6 @@
 import { Region, FitMode, clampRegion, regionToSource, videoRectToScreen, SourceRect } from './geometry'
 import { getOcrWorker, recognizeCanvas, OcrLine } from './ocr'
+import { wordPlausibility } from './ppocr'
 import { inkMasks, inkMasksInSlices } from './ink'
 
 export { inkMasks }
@@ -33,6 +34,24 @@ export interface TranslatorConfig {
 
 // How much a picture is enlarged before the modern reader reads it (1: not at all)
 const COLOR_READ_SCALE = 1
+
+/**
+ * A reader of English that is shown a text in the Cyrillic script (the plate of this plugin, the interface of Steam in Russian) reads the letters as the Latin letters and digits they look like:
+ * "Bawa no3nuin!", "Ha3an Bn6pain", "18 6epe3H9 1905 poky". A word that has a digit between letters is not a word of a game; two such words, or one in a line that is not made of real words, say that
+ * the line is not English at all.
+ */
+export function looksLikeForeignScript(text: string): boolean {
+    const tokens = text.trim().split(/\s+/).filter(token => token !== '')
+    const mixed = tokens.filter(token => /[A-Za-z][0-9][A-Za-z]/.test(token))
+    if(mixed.length >= 2){
+        return true
+    }
+    // One long word that is letters and digits taken turns ("6epe3H9" for "березня"): no word of a game looks like that
+    if(tokens.some(token => token.length >= 6 && (token.match(/[0-9]+/g) ?? []).length >= 2 && (token.match(/[A-Za-z]/g) ?? []).length >= 3)){
+        return true
+    }
+    return mixed.length === 1 && tokens.length >= 3 && wordPlausibility(text) < 0.35
+}
 
 /** Where the time of the readings goes (for the performance report and the tests): preparing the picture, reading it, the number of readings. */
 export const readTimes = { prepare: 0, recognize: 0, reads: 0, draw: 0, pixels: 0, ink: 0, rest: 0 }
@@ -1957,6 +1976,9 @@ export default class TranslatorEngine {
         // Clean the lines and drop what is not text
         const lines: Array<{ line: OcrLine; text: string }> = []
         for(const line of result.lines){
+            if(looksLikeForeignScript(line.text)){
+                continue
+            }
             const text = cleanOcrText(line.text)
             if(text !== ''){
                 lines.push({ line, text })

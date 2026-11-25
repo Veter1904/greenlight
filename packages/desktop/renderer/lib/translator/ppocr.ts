@@ -100,6 +100,11 @@ function splitWords(letters: string): number[] | null {
 }
 
 /** How much of a reading is made of real words (0..1): a reader that mistakes letters of a pixel font reads "Obtoined o Life Copsule". Without the word list: 1. */
+/** How much of a reading is made of real English words (0..1); 1 when there is no word list. */
+export function wordPlausibility(text: string): number {
+    return plausibility(text)
+}
+
 function plausibility(text: string): number {
     if(wordCost === null){
         return 1
