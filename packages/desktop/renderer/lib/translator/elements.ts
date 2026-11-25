@@ -96,6 +96,11 @@ const KEEP_FAILURES = 3
 // time, so it looks at the picture when it has changed, and at least this often
 const DETECT_GAP_MS = 2500
 const DETECT_MAX_GAP_MS = 12000
+// A busy moving picture (a screen of digits) makes the detector see letters everywhere: only lines of text are taken (wider than tall), the biggest first, and
+// the detector is asked less often when it is slow
+const DETECT_MIN_ASPECT = 1.0
+const DETECT_MAX_BOXES = 24
+const DETECT_SLOW_FACTOR = 6
 const DETECT_CHANGE = 6
 // Lines of text that stand one under the other with the same left edge, the same height and a small gap are one paragraph: they are read and translated together
 const PARAGRAPH_GAP = 0.7
@@ -137,6 +142,8 @@ interface Segment extends TranslatedSegment {
     base?: [number, number, number];
     // The colour of the letters now
     ink?: [number, number, number];
+    // Brightness of the letters as the reader saw them (the first colour of the plate): the colour of the ink must be on the same side of the background
+    fgLuma0?: number;
 }
 
 interface Element {
@@ -185,6 +192,19 @@ interface Cells {
 }
 
 // How much of the first box lies inside the second one (0..1)
+/** "#rrggbb" or "rgb(r, g, b)" as numbers; null when it is neither. */
+function cssColor(value: string | undefined): number[] | null {
+    if(value === undefined){
+        return null
+    }
+    const hex = /^#([0-9a-f]{6})$/i.exec(value)
+    if(hex !== null){
+        return [parseInt(hex[1].slice(0, 2), 16), parseInt(hex[1].slice(2, 4), 16), parseInt(hex[1].slice(4, 6), 16)]
+    }
+    const rgb = /^rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(value)
+    return rgb === null ? null : [Number(rgb[1]), Number(rgb[2]), Number(rgb[3])]
+}
+
 function inside(inner: Region, outer: Region): number {
     const width = Math.min(inner.x + inner.w, outer.x + outer.w) - Math.max(inner.x, outer.x)
     const height = Math.min(inner.y + inner.h, outer.y + outer.h) - Math.max(inner.y, outer.y)
@@ -354,6 +374,7 @@ export default class ElementsEngine {
     _detected: Array<{ x: number; y: number; w: number; h: number; polarity: Polarity }> = []
     _detectedAt = 0
     _detectMs = 0
+    _lastDetectMs = 0
     _detectThumb: Uint8Array | null = null
     _lookChanged = false
     _lastWake = 0
@@ -449,7 +470,7 @@ export default class ElementsEngine {
             }
             change /= thumb.length
         }
-        const due = this._detectThumb === null || now - this._detectedAt >= DETECT_MAX_GAP_MS || (change > DETECT_CHANGE && now - this._detectedAt >= DETECT_GAP_MS)
+        const due = this._detectThumb === null || now - this._detectedAt >= DETECT_MAX_GAP_MS || (change > DETECT_CHANGE && now - this._detectedAt >= Math.max(DETECT_GAP_MS, this._lastDetectMs * DETECT_SLOW_FACTOR))
         if(!due){
             return this._detected
         }
@@ -457,8 +478,10 @@ export default class ElementsEngine {
         this._detectedAt = now
         const detectStarted = Date.now()
         const boxes = await ppocrDetectBoxes(pixels, width, height)
-        this._detectMs += Date.now() - detectStarted
-        this._detected = this._joinParagraphs(boxes).slice(0, MAX_BLOCKS).map((box) => {
+        this._lastDetectMs = Date.now() - detectStarted
+        this._detectMs += this._lastDetectMs
+        const lines = this._joinParagraphs(boxes).filter(box => box.w >= box.h * DETECT_MIN_ASPECT).sort((a, b) => b.w * b.h - a.w * a.h).slice(0, DETECT_MAX_BOXES)
+        this._detected = lines.map((box) => {
             // The letters are the smaller part of the box: bright ones on a dark ground, or dark ones on a light ground
             const x0 = Math.max(0, Math.floor(box.x))
             const y0 = Math.max(0, Math.floor(box.y))
@@ -795,6 +818,17 @@ export default class ElementsEngine {
                     h: segment.rect.h / element.rect.h * element.scan.h,
                 }
                 const color = inkColor(pixels, mask.mask, width, height, box, element.polarity)
+                // The colour of the letters must be on the same side of the background as the letters the reader saw (a text in light letters on a dark bar
+                // is not turned into dark ones because the mask of the other polarity caught the bar itself)
+                const luma = (c: number[]) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+                const under = segment.base ?? segment.background
+                if(segment.fgLuma0 === undefined){
+                    const seen = cssColor(segment.foreground)
+                    segment.fgLuma0 = seen === null ? -1 : luma(seen)
+                }
+                if(color !== null && under !== undefined && segment.fgLuma0 >= 0 && (segment.fgLuma0 > luma(under)) !== (luma(color) > luma(under))){
+                    continue
+                }
                 if(color === null || (segment.ink !== undefined && Math.hypot(color[0] - segment.ink[0], color[1] - segment.ink[1], color[2] - segment.ink[2]) <= INK_CHANGED)){
                     continue
                 }
