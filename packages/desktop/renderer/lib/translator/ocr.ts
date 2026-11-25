@@ -46,6 +46,23 @@ function renewAbort() {
     aborted = new Promise((resolve) => { abortReading = () => resolve('aborted') })
 }
 
+// The reader library (tesseract.js) starts a job on its worker with a call that fails when the worker was shut down a moment before ("Cannot read properties of null
+// (reading 'postMessage')"): the stream was closed, the language was changed. The failed promise is inside the library, where nothing of ours can catch it, and it reached the
+// page as an unhandled rejection and was shown in an alert. Nobody waits for that reading any more (see `aborted`), so the error is dropped, for a while after a shut down only.
+let lastShutdownAt = 0
+export function isReaderShutdownError(reason: unknown): boolean {
+    return /Cannot read propert(y|ies) of null \(reading 'postMessage'\)/.test(String((reason as any)?.message ?? reason))
+}
+if(typeof window !== 'undefined'){
+    window.addEventListener('unhandledrejection', (event: PromiseRejectionEvent) => {
+        if(isReaderShutdownError(event.reason) && Date.now() - lastShutdownAt < 60000){
+            event.preventDefault()
+            // the handlers of the page that come after this one must not show it either
+            event.stopImmediatePropagation()
+        }
+    })
+}
+
 export function getOcrWorker(language = 'en'): Promise<Worker> {
     closed = false
     return makeOcrWorker(language)
@@ -281,6 +298,7 @@ async function readCanvas(worker: Worker, canvas: HTMLCanvasElement, maxGap: num
 
 export async function terminateOcr(): Promise<void> {
     closed = true
+    lastShutdownAt = Date.now()
     // The readings that wait for the reader give up (and the next reader starts with a clean slate)
     abortReading()
     renewAbort()

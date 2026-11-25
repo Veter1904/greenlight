@@ -116,6 +116,58 @@ function plausibility(text: string): number {
     return words === 0 ? 1 : known / words
 }
 
+export // Letters that the reader mixes up in small, pixel-like fonts ("Dycle" for "Cycle", "Seroll" for "Scroll", "Iist" for "list")
+const CONFUSED: string[] = ['ceoa', 'od0q', 'li1tj', 'uvnrw', 'hbk', 'mn', 'sz5', 'gq', 'ft', 'yv', 'dc']
+const CONFUSED_WITH = new Map<string, string>()
+for(const group of CONFUSED){
+    for(const letter of group){
+        CONFUSED_WITH.set(letter, (CONFUSED_WITH.get(letter) ?? '') + group.replace(letter, ''))
+    }
+}
+// Only words this common are believed as a correction
+const COMMON_RANK = 30000
+
+/** A word that is not a word but is one confused letter away from a common word is that word; null when it is a word, a name, or nothing is near. */
+function nearWord(token: string): string | null {
+    if(wordCost === null || token.length < 4 || token.length > 14){
+        return null
+    }
+    const lower = token.toLowerCase()
+    const limit = Math.log(COMMON_RANK * Math.log(wordCost.size))
+    if(wordCost.has(lower) || wordCost.has(lower.replace(/s$/, '')) || wordCost.has(lower.replace(/(ed|ing|ly)$/, ''))){
+        return null
+    }
+    let best: string | null = null
+    let bestCost = limit
+    for(let i = 0; i < lower.length; i++){
+        for(const letter of CONFUSED_WITH.get(lower[i]) ?? ''){
+            const candidate = lower.slice(0, i) + letter + lower.slice(i + 1)
+            const cost = wordCost.get(candidate)
+            if(cost !== undefined && cost < bestCost){
+                best = candidate
+                bestCost = cost
+            }
+        }
+    }
+    if(best === null){
+        return null
+    }
+    // the same way of writing as the word that was read
+    if(token === token.toUpperCase()){
+        return best.toUpperCase()
+    }
+    // a capital I that is really a small l ("Iist") is not a capital
+    return token[0] === token[0].toUpperCase() && !(token[0] === 'I' && best[0] !== 'i') ? best[0].toUpperCase() + best.slice(1) : best
+}
+
+/** Every word of a line that the reader got wrong by a confused letter is put right (a word that is a word, or a name nothing is near to, is left as it is). */
+export function fixNearWords(text: string): string {
+    if(wordCost === null){
+        return text
+    }
+    return text.replace(/[A-Za-z]{4,14}/g, (word, offset: number) => (offset > 0 && text[offset - 1] === "'") ? word : (nearWord(word) ?? word))
+}
+
 export function splitJoinedWords(text: string): string {
     if(wordCost === null){
         return text
@@ -396,7 +448,7 @@ async function recognizeBox(rgba: Uint8ClampedArray, width: number, height: numb
     for(const letter of letters){
         text += letter.text
     }
-    const joined = splitJoinedWords(text)
+    const joined = fixNearWords(splitJoinedWords(text))
     // A reading that is mostly not words is less sure than the recognizer thinks (the other reader may do better)
     return { text: joined, confidence: count > 0 ? (100 * sum / count) * (0.35 + 0.65 * plausibility(joined)) : 0 }
 }

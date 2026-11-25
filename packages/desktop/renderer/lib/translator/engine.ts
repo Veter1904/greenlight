@@ -2034,7 +2034,8 @@ export default class TranslatorEngine {
 
         const sameSize = nextHeight > lastHeight * 0.75 && nextHeight < lastHeight * 1.33
         const sameLeft = Math.abs(next.line.bbox.x0 - last.line.bbox.x0) < lastHeight * 1.2
-        const wrapped = last.text.split(/\s+/).length >= 3
+        // A short row ("Back to list") is an item of a menu, not the wrapped line of a paragraph
+        const wrapped = last.text.split(/\s+/).length >= 3 && last.text.length >= 16
 
         // The right margin of the paragraph: the furthest right edge of the lines of the same size and left edge
         let right = last.line.bbox.x1

@@ -83,8 +83,12 @@ export default function MyApp({ Component, pageProps }) {
         }, 500)
 
         const errorHandler = function(event) {
+            // Something that already took care of the rejection (the text reader that was shut down) has said so
+            if(event.defaultPrevented){
+                return
+            }
             console.error('Unhandled rejection (promise: ', event.promise, ', reason: ', event.reason, ').')
-            if(event.reason.status){
+            if(event.reason && event.reason.status){
                 alert('HTTP Status: ' + event.reason.status + '\nPath:' + event.reason.url + '\n' + event.reason.body)
             } else {
                 alert(event.reason)
