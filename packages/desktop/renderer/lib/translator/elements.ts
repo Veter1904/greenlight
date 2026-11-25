@@ -176,13 +176,15 @@ function brightnessOf(color: number[]): number {
 
 // A pixel is "coloured" when its brightest and darkest channel are this far apart (the yellow of a letter, not the grey of a picture)
 const CHROMA = 90
+// The mask of dark letters is an outline (the letters are inside it) when it is this dark
+const OUTLINE_BLACK = 45
 
 /**
  * The colour of the letters in a place of the picture, or null when there is not enough to tell. Letters that are drawn with
  * a dark outline (a lot of games) are found by their outline, so the mask alone would give black: when the place has coloured
  * pixels, their mean is the colour of the letters; otherwise it is the mean of the text mask.
  */
-function inkColor(pixels: Uint8ClampedArray, mask: Uint8Array, width: number, height: number, box: Region): [number, number, number] | null {
+function inkColor(pixels: Uint8ClampedArray, mask: Uint8Array, width: number, height: number, box: Region, polarity: Polarity): [number, number, number] | null {
     const x0 = Math.max(0, Math.floor(box.x * width))
     const y0 = Math.max(0, Math.floor(box.y * height))
     const x1 = Math.min(width, Math.ceil((box.x + box.w) * width))
@@ -215,10 +217,17 @@ function inkColor(pixels: Uint8ClampedArray, mask: Uint8Array, width: number, he
             }
         }
     }
-    if(colored >= 12 && colored >= count * 0.15){
+    if(count < 8){
+        return colored >= 12 ? [Math.round(cr / colored), Math.round(cg / colored), Math.round(cb / colored)] : null
+    }
+    const mean: [number, number, number] = [Math.round(r / count), Math.round(g / count), Math.round(b / count)]
+    // Dark letters that are really a dark outline (the mask is nearly black) have their colour inside; dark letters that are not black
+    // (dark teal on a bright button) are what they are, the coloured pixels there are the button
+    const outline = polarity === 'dark' && brightnessOf(mean) < OUTLINE_BLACK
+    if((polarity === 'light' || outline) && colored >= 12 && colored >= count * 0.15){
         return [Math.round(cr / colored), Math.round(cg / colored), Math.round(cb / colored)]
     }
-    return count < 8 ? null : [Math.round(r / count), Math.round(g / count), Math.round(b / count)]
+    return mean
 }
 
 /** The colours of a plate: the text keeps the colour of the original letters; the plate is made dark or light enough to read it. */
@@ -521,7 +530,7 @@ export default class ElementsEngine {
                     w: segment.rect.w / element.rect.w * element.scan.w,
                     h: segment.rect.h / element.rect.h * element.scan.h,
                 }
-                const color = inkColor(pixels, mask.mask, width, height, box)
+                const color = inkColor(pixels, mask.mask, width, height, box, element.polarity)
                 if(color === null || (segment.ink !== undefined && Math.hypot(color[0] - segment.ink[0], color[1] - segment.ink[1], color[2] - segment.ink[2]) <= INK_CHANGED)){
                     continue
                 }
