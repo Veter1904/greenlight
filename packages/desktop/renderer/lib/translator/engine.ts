@@ -1883,6 +1883,17 @@ export default class TranslatorEngine {
             return null
         }
 
+        // A black-and-white picture with (almost) no black in it has nothing to read: the reader is not started for it
+        if(raw === false){
+            let black = 0
+            for(let i = 0; i < prepared.ink.length; i++){
+                black += prepared.ink[i]
+            }
+            if(black < Math.max(20, prepared.ink.length * 0.004)){
+                return null
+            }
+        }
+
         const result = await recognizeCanvas(prepared.canvas, job.config.source, this._options.priority ?? 1, job.config.mode === 'task' ? TASK_WORD_GAP : DIALOG_WORD_GAP, job.config.fullScreen === true ? 'page' : 'block')
         if(result.confidence < MIN_CONFIDENCE){
             return null
