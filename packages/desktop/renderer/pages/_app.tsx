@@ -1,3 +1,4 @@
+import { isHarmlessReaderRejection } from '../lib/translator/readererrors'
 import '../styles.css'
 
 import React from 'react'
@@ -84,7 +85,7 @@ export default function MyApp({ Component, pageProps }) {
 
         const errorHandler = function(event) {
             // Something that already took care of the rejection (the text reader that was shut down) has said so
-            if(event.defaultPrevented){
+            if(event.defaultPrevented || isHarmlessReaderRejection(event.reason)){
                 return
             }
             console.error('Unhandled rejection (promise: ', event.promise, ', reason: ', event.reason, ').')

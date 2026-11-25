@@ -1,5 +1,6 @@
 import type { Worker } from 'tesseract.js'
 import { ppocrReady, ppocrRecognize } from './ppocr'
+import { isHarmlessReaderRejection, markReaderShutdown } from './readererrors'
 
 // The OCR engine (Tesseract compiled to WebAssembly) and the English language data are bundled with the app
 // (renderer/public/tesseract), so reading English works offline. The language data of any other language
@@ -46,21 +47,15 @@ function renewAbort() {
     aborted = new Promise((resolve) => { abortReading = () => resolve('aborted') })
 }
 
-// The reader library (tesseract.js) starts a job on its worker with a call that fails when the worker was shut down a moment before ("Cannot read properties of null
-// (reading 'postMessage')"): the stream was closed, the language was changed. The failed promise is inside the library, where nothing of ours can catch it, and it reached the
-// page as an unhandled rejection and was shown in an alert. Nobody waits for that reading any more (see `aborted`), so the error is dropped, for a while after a shut down only.
-let lastShutdownAt = 0
-export function isReaderShutdownError(reason: unknown): boolean {
-    return /Cannot read propert(y|ies) of null \(reading 'postMessage'\)/.test(String((reason as any)?.message ?? reason))
-}
+// A reading that is sent to a reader that was shut down a moment ago fails inside the library (see readererrors.ts): that error is dropped. This listener comes first (the capture
+// phase), and stops the handlers of the page that come after it; the handler of the page asks readererrors.ts too, in case it was registered before this one.
 if(typeof window !== 'undefined'){
     window.addEventListener('unhandledrejection', (event: PromiseRejectionEvent) => {
-        if(isReaderShutdownError(event.reason) && Date.now() - lastShutdownAt < 60000){
+        if(isHarmlessReaderRejection(event.reason)){
             event.preventDefault()
-            // the handlers of the page that come after this one must not show it either
             event.stopImmediatePropagation()
         }
-    })
+    }, true)
 }
 
 export function getOcrWorker(language = 'en'): Promise<Worker> {
@@ -298,7 +293,7 @@ async function readCanvas(worker: Worker, canvas: HTMLCanvasElement, maxGap: num
 
 export async function terminateOcr(): Promise<void> {
     closed = true
-    lastShutdownAt = Date.now()
+    markReaderShutdown()
     // The readings that wait for the reader give up (and the next reader starts with a clean slate)
     abortReading()
     renewAbort()
