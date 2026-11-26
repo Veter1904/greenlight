@@ -179,7 +179,12 @@ const GOOD_COVERAGE = 0.6
 // The picture in grey is tried (it takes time) only for places that look like text to the scout
 const RAW_MIN_SCORE = 50
 
+// Written with RegExp: the build compiles for an old target that does not accept the "u" flag in a pattern written as one
 const LETTER = new RegExp('\\p{L}', 'gu')
+const HAS_LETTER = new RegExp('\\p{L}', 'u')
+const NOT_LETTER = new RegExp('[^\\p{L}]', 'gu')
+const NOT_ALNUM = new RegExp('[^\\p{L}\\p{N}]', 'gu')
+const NOT_WORD = new RegExp('[^\\p{L}\\p{N}\' ]+', 'gu')
 
 interface Segment extends TranslatedSegment {
     template: string;
@@ -1814,9 +1819,9 @@ export default class ElementsEngine {
 
         // Short words only ("and i as") from a place that only the detector found: the pattern of an ornament, not a sentence
         if(result !== null && element.detected === true){
-            const words = result.segments.flatMap(segment => segment.text.split(/\s+/)).filter(word => /\p{L}/u.test(word))
+            const words = result.segments.flatMap(segment => segment.text.split(/\s+/)).filter(word => HAS_LETTER.test(word))
             const letters = result.segments.reduce((sum, segment) => sum + (segment.text.match(LETTER) || []).length, 0)
-            if(words.length >= 3 && words.every(word => word.replace(/[^\p{L}]/gu, '').length <= 3) && letters < 10){
+            if(words.length >= 3 && words.every(word => word.replace(NOT_LETTER, '').length <= 3) && letters < 10){
                 result = null
             }
         }
@@ -2033,8 +2038,8 @@ export default class ElementsEngine {
                     continue
                 }
                 // only the same text : another text at the same place is not a copy
-                const textA = a.segment.original.toUpperCase().replace(/[^\p{L}\p{N}]/gu, '')
-                const textB = b.segment.original.toUpperCase().replace(/[^\p{L}\p{N}]/gu, '')
+                const textA = a.segment.original.toUpperCase().replace(NOT_ALNUM, '')
+                const textB = b.segment.original.toUpperCase().replace(NOT_ALNUM, '')
                 if(textA.length === 0 || textB.length === 0 || textA !== textB){
                     continue
                 }
@@ -2049,7 +2054,7 @@ export default class ElementsEngine {
         // One text has one plate. A paragraph is found at several sizes (the paragraph, its lines, a piece of a line) and each is read on its own, some of the readings with
         // words lost or broken: of two plates that lie one over the other, the part goes when the other has its words, and a broken piece inside a bigger text goes.
         if((globalThis as any).DLT_NODEDUPE !== true){
-            const wordsOf = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, ' ').split(/\s+/).filter(word => word.length >= 3)
+            const wordsOf = (text: string) => text.toLowerCase().replace(NOT_WORD, ' ').split(/\s+/).filter(word => word.length >= 3)
             for(const a of flat){
                 if(dropped.has(a.segment)){
                     continue
@@ -2089,7 +2094,7 @@ export default class ElementsEngine {
         // A piece that is lower than the lines of the text around it (the same part of the screen) and does not read as words, or has a few letters only, is a part of a line that was cut out wrongly
         if((globalThis as any).DLT_NODEDUPE !== true){
             for(const a of flat){
-                if(dropped.has(a.segment) || (wordPlausibility(a.segment.original) >= COVER_SLIVER_QUALITY && (a.segment.original.match(/\p{L}/gu) || []).length > COVER_SLIVER_LETTERS)){
+                if(dropped.has(a.segment) || (wordPlausibility(a.segment.original) >= COVER_SLIVER_QUALITY && (a.segment.original.match(LETTER) || []).length > COVER_SLIVER_LETTERS)){
                     continue
                 }
                 const peers = flat.filter(b => b !== a && !dropped.has(b.segment) && Math.abs(b.segment.rect.y - a.segment.rect.y) < COVER_SLIVER_COLUMN && b.segment.lineHeight > 0 && wordPlausibility(b.segment.original) >= 0.9).map(b => b.segment.lineHeight).sort((x, y) => x - y)
