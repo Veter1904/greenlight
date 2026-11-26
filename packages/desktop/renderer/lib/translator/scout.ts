@@ -25,6 +25,8 @@ export interface TextBlock {
     // The panel of the interface the text sits on (fractions of the picture), when its edges were found
     panel?: { x: number; y: number; w: number; h: number };
     stats?: { fill: number; ratio: number; onShare: number };
+    // Found by the detector of the modern reader (not by the scout): it is read in its natural colours, in one go
+    detected?: boolean;
 }
 
 // The picture is looked at in cells of CELL x CELL pixels: a cell is "on" when it holds some text-coloured ink
@@ -38,8 +40,8 @@ const MAX_INK_SHARE = 0.2
 
 // What a row of letters looks like: not too thin, not too tall, much wider than tall, with gaps between the letters
 const MIN_HEIGHT_CELLS = 3
-const MIN_WIDTH_CELLS = 10
-const MIN_ASPECT = 2.2
+const MIN_WIDTH_CELLS = 6
+const MIN_ASPECT = 1.2
 const MAX_BLOCK_HEIGHT = 0.3
 const MIN_FILL = 0.06
 const MAX_FILL = 0.55
@@ -51,6 +53,11 @@ const SMALL_WIDTH_CELLS = 16
 const SMALL_RING_RATIO = 6
 const MIN_ON_SHARE_ROW = 0.3
 const MIN_ON_SHARE_BLOCK = 0.2
+const BUSY_ON_SHARE = 0.45
+// Two blocks on the same place are the same text only when they are about the same size (the bigger one at most this many times the area)
+const SAME_PLACE_AREA = 3
+const BUSY_RATIO = 0.9
+const BUSY_SCORE_RATIO = 2.5
 // How strongly the ink inside must be more than around for a line to need fewer 'on' cells
 const STRONG_RATIO = 15
 // A plate: the background around the text is this flat (the spread of the brightness) and differs from what lies beyond it
@@ -67,7 +74,7 @@ const MAX_BLOCK_WIDTH = 0.88
 const LINE_GAP = 1.1
 const MAX_BLOCKS = 10
 // A block that scores less than this (per pixel of the width of the picture) is noise: 90 on a picture 1280 wide
-const MIN_SCORE_PER_PIXEL = 0.07
+const MIN_SCORE_PER_PIXEL = 0.04
 
 interface Part {
     x0: number;
@@ -303,6 +310,123 @@ function partsOfMask(mask: Uint8Array, width: number, height: number, polarity: 
     return { parts, ink, columns, rows }
 }
 
+// A part taller than this (fraction of the picture) may be several rows that were joined (a menu: big words one under another whose
+// outlines touch) and is cut into rows where there is (almost) no ink
+const SPLIT_HEIGHT = 0.15
+const SPLIT_VALLEY = 0.12
+
+/** Cuts a tall part into rows at the places where the row of cells has (almost) no ink. */
+function splitRows(part: Part, ink: Uint16Array, columns: number): Part[] {
+    const counts: number[] = []
+    let most = 0
+    for(let y = part.y0; y < part.y1; y++){
+        let n = 0
+        for(let x = part.x0; x < part.x1; x++){
+            if(ink[y * columns + x] >= MIN_CELL_INK){
+                n++
+            }
+        }
+        counts.push(n)
+        most = Math.max(most, n)
+    }
+
+    const cut = Math.max(1, most * SPLIT_VALLEY)
+    const rows: Part[] = []
+    let start = -1
+    const flush = (end: number) => {
+        if(start >= 0 && end - start >= MIN_HEIGHT_CELLS){
+            let x0 = part.x1
+            let x1 = part.x0
+            let total = 0
+            let on = 0
+            for(let y = part.y0 + start; y < part.y0 + end; y++){
+                for(let x = part.x0; x < part.x1; x++){
+                    const value = ink[y * columns + x]
+                    total += value
+                    if(value >= MIN_CELL_INK){
+                        on++
+                        x0 = Math.min(x0, x)
+                        x1 = Math.max(x1, x)
+                    }
+                }
+            }
+            if(x1 >= x0){
+                rows.push({ x0, y0: part.y0 + start, x1: x1 + 1, y1: part.y0 + end, ink: total, on, polarity: part.polarity })
+            }
+        }
+        start = -1
+    }
+    counts.forEach((n, i) => {
+        if(n > cut){
+            if(start < 0){
+                start = i
+            }
+        } else {
+            flush(i)
+        }
+    })
+    flush(counts.length)
+    return rows.length > 1 ? rows : [part]
+}
+
+// A part wider than the limit for a block is cut where there is a wide empty gap (a row of buttons, a table: not one text)
+const SPLIT_GAP_CELLS = 8
+// A part wider than this (fraction of the picture) is cut at the empty gaps
+const SPLIT_WIDTH = 0.4
+
+/** Cuts a wide part into pieces at the wide empty gaps between columns of cells. */
+function splitColumns(part: Part, ink: Uint16Array, columns: number): Part[] {
+    const pieces: Part[] = []
+    let start = -1
+    let empty = 0
+    const flush = (end: number) => {
+        if(start < 0){
+            return
+        }
+        let y0 = part.y1
+        let y1 = part.y0
+        let total = 0
+        let on = 0
+        for(let y = part.y0; y < part.y1; y++){
+            for(let x = start; x < end; x++){
+                const value = ink[y * columns + x]
+                total += value
+                if(value >= MIN_CELL_INK){
+                    on++
+                    y0 = Math.min(y0, y)
+                    y1 = Math.max(y1, y)
+                }
+            }
+        }
+        if(y1 >= y0 && end - start >= MIN_WIDTH_CELLS){
+            pieces.push({ x0: start, y0, x1: end, y1: y1 + 1, ink: total, on, polarity: part.polarity })
+        }
+        start = -1
+    }
+    for(let x = part.x0; x < part.x1; x++){
+        let n = 0
+        for(let y = part.y0; y < part.y1; y++){
+            if(ink[y * columns + x] >= MIN_CELL_INK){
+                n++
+            }
+        }
+        if(n > 0){
+            if(start < 0){
+                start = x
+            }
+            empty = 0
+        } else if(start >= 0){
+            empty++
+            if(empty >= SPLIT_GAP_CELLS){
+                flush(x - empty + 1)
+                empty = 0
+            }
+        }
+    }
+    flush(part.x1 - empty)
+    return pieces.length > 1 ? pieces : [part]
+}
+
 // Lines of text that stand one under another and line up are one block
 function mergeLines(parts: Part[], rows: number): Part[] {
     const list = parts.slice()
@@ -379,8 +503,11 @@ export function analyseScreen(data: Uint8ClampedArray, width: number, height: nu
             return
         }
 
-        // Rows of letters (not yet the blocks they make up)
-        const lines = found.parts.filter((part) => {
+        // Rows of letters (not yet the blocks they make up); a part that is tall enough to be several rows is cut into them first
+        const candidates = found.parts
+            .flatMap(part => (part.y1 - part.y0) * CELL > SPLIT_HEIGHT * height ? splitRows(part, found.ink, found.columns) : [part])
+            .flatMap(part => (part.x1 - part.x0) * CELL > SPLIT_WIDTH * width ? splitColumns(part, found.ink, found.columns) : [part])
+        const lines = candidates.filter((part) => {
             const w = part.x1 - part.x0
             const h = part.y1 - part.y0
             return h >= MIN_HEIGHT_CELLS && w >= MIN_WIDTH_CELLS && w >= h && h * CELL <= MAX_BLOCK_HEIGHT * height
@@ -426,7 +553,11 @@ export function analyseScreen(data: Uint8ClampedArray, width: number, height: nu
             const onShare = part.on / (w * h)
             // A text that stands out a lot from its surroundings may be thin (a line with wide spaces between the words)
             const minOn = (single ? MIN_ON_SHARE_ROW : MIN_ON_SHARE_BLOCK) * (ratio >= STRONG_RATIO ? 0.6 : 1)
-            if(ratio < (w < SMALL_WIDTH_CELLS ? SMALL_RING_RATIO : RING_RATIO) || onShare < minOn){
+            // A row of letters on a busy panel (a striped button, an icon next to it) has ink around it too: when most of its cells
+            // are ink, a smaller difference to the ring is enough
+            const need = w < SMALL_WIDTH_CELLS ? SMALL_RING_RATIO : RING_RATIO
+            const busy = ratio < need && onShare >= BUSY_ON_SHARE && ratio >= BUSY_RATIO
+            if((ratio < need && !busy) || onShare < minOn){
                 continue
             }
 
@@ -440,14 +571,15 @@ export function analyseScreen(data: Uint8ClampedArray, width: number, height: nu
             const plate = hasPlate(data, fine.mask, width, height, textBox)
             const found = plate ? findPanel(data, fine.mask, width, height, textBox) : null
             const panel = found === null ? undefined : { x: found.x0 / width, y: found.y0 / height, w: (found.x1 - found.x0) / width, h: (found.y1 - found.y0) / height }
-            blocks.push({ ...block, ...(panel === undefined ? {} : { panel }), polarity: part.polarity, role: classify(block), plate, score: Math.min(ratio, 12) * Math.sqrt(part.ink) * (plate ? 1.5 : 1), stats: { fill, ratio, onShare } })
+            blocks.push({ ...block, ...(panel === undefined ? {} : { panel }), polarity: part.polarity, role: classify(block), plate, score: Math.min(busy ? Math.max(ratio, BUSY_SCORE_RATIO) : ratio, 12) * Math.sqrt(part.ink) * (plate ? 1.5 : 1), stats: { fill, ratio, onShare } })
         }
     })
 
     // The same place found as light and as dark text (an outline): keep the bigger one
     const kept: TextBlock[] = []
+    // (a small block inside a much bigger one is not the same text: a row of letters on a big button, which is a "block" of its own)
     for(const block of blocks.sort((a, b) => b.w * b.h - a.w * a.h)){
-        if(!kept.some(other => overlapShare(block, other) > 0.6)){
+        if(!kept.some(other => overlapShare(block, other) > 0.6 && other.w * other.h < block.w * block.h * SAME_PLACE_AREA)){
             kept.push(block)
         }
     }

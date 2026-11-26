@@ -1,4 +1,6 @@
 import type { Worker } from 'tesseract.js'
+import { ppocrReady, ppocrRecognize } from './ppocr'
+import { isHarmlessReaderRejection, markReaderShutdown } from './readererrors'
 
 // The OCR engine (Tesseract compiled to WebAssembly) and the English language data are bundled with the app
 // (renderer/public/tesseract), so reading English works offline. The language data of any other language
@@ -35,14 +37,38 @@ function assetUrl(path: string): string {
 let closed = false
 const NOTHING: OcrResult = { text: '', confidence: 0, lines: [] }
 
-// Settles when the reader is shut down. The library does not settle a reading that is sent to a reader that has been shut down
-// (it only drops an error that nobody can catch: "Cannot read properties of null (reading 'postMessage')"), so a reading that is
-// waiting for the reader gives up when this settles, and the reader is not left in use for ever.
+// The calls into the library that are under way. The library's reader must not be shut down while there is one: recognize()
+// prepares the picture first (that takes a while) and only then writes to its worker, and when the worker is gone by then the
+// library drops an error that nobody can catch ("Cannot read properties of null (reading 'postMessage')") and never settles
+// the call. So the shutdown waits for them (see shutDownReader), at most this long.
+const running = new Set<Promise<unknown>>()
+const SHUTDOWN_WAIT = 20000
+
+function track<T>(call: Promise<T>): Promise<T> {
+    running.add(call)
+    const done = () => { running.delete(call) }
+    call.then(done, done)
+    return call
+}
+
+// Settles when the reader is shut down: a reading that is waiting for the reader gives up at once (its answer is not wanted
+// any more), and the reader is not left in use.
 type Abort = Promise<'aborted'>
 let abortReading: () => void = () => { /* replaced below */ }
 let aborted: Abort = new Promise((resolve) => { abortReading = () => resolve('aborted') })
 function renewAbort() {
     aborted = new Promise((resolve) => { abortReading = () => resolve('aborted') })
+}
+
+// A reading that is sent to a reader that was shut down a moment ago fails inside the library (see readererrors.ts): that error is dropped. This listener comes first (the capture
+// phase), and stops the handlers of the page that come after it; the handler of the page asks readererrors.ts too, in case it was registered before this one.
+if(typeof window !== 'undefined'){
+    window.addEventListener('unhandledrejection', (event: PromiseRejectionEvent) => {
+        if(isHarmlessReaderRejection(event.reason)){
+            event.preventDefault()
+            event.stopImmediatePropagation()
+        }
+    }, true)
 }
 
 export function getOcrWorker(language = 'en'): Promise<Worker> {
@@ -54,8 +80,8 @@ function makeOcrWorker(language: string): Promise<Worker> {
     const code = SOURCE_LANGUAGES[language] ? language : 'en'
 
     if(workerPromise !== null && workerLanguage !== code){
-        // The reading language was changed: the old reader is not needed any more
-        void terminateOcr()
+        // The reading language was changed: the old reader is not needed any more (the reading goes on with a new one)
+        void shutDownReader()
     }
 
     if(workerPromise === null){
@@ -156,7 +182,21 @@ function releaseReader() {
 // with text of different sizes in different places (the whole screen). Set again only when it changes.
 let currentLayout: 'block' | 'page' | null = null
 
-export async function recognizeCanvas(canvas: HTMLCanvasElement, language = 'en', priority = 1, maxGap = MAX_WORD_GAP, layout: 'block' | 'page' = 'block'): Promise<OcrResult> {
+// Which reader looks at a picture: Tesseract, PP-OCR (when it is loaded), or PP-OCR first and Tesseract for what it did not read
+export type ReaderMode = 'tesseract' | 'ppocr' | 'both'
+let readerMode: ReaderMode = 'tesseract'
+export function getReaderMode(): ReaderMode {
+    return readerMode
+}
+export function setReaderMode(mode: ReaderMode) {
+    readerMode = mode
+}
+
+export async function recognizeCanvas(canvas: HTMLCanvasElement, language = 'en', priority = 1, maxGap = MAX_WORD_GAP, layout: 'block' | 'page' = 'block', natural = false): Promise<OcrResult> {
+    // The modern reader reads the pictures in their natural colours; the black-and-white and grey ones are for Tesseract
+    if(readerMode !== 'tesseract' && ppocrReady() && (natural || readerMode === 'ppocr')){
+        return ppocrRecognize(canvas)
+    }
     await acquireReader(priority)
     // The reader that is shut down while this reading goes on is not used any more (see aborted)
     const mine = aborted
@@ -171,7 +211,7 @@ export async function recognizeCanvas(canvas: HTMLCanvasElement, language = 'en'
         }
 
         if(currentLayout !== layout){
-            const outcome = await Promise.race([worker.setParameters({ tessedit_pageseg_mode: (layout === 'page' ? '3' : '6') as any }), mine])
+            const outcome = await Promise.race([track(worker.setParameters({ tessedit_pageseg_mode: (layout === 'page' ? '3' : '6') as any })), mine])
             if(outcome === 'aborted' || mine !== aborted){
                 return NOTHING
             }
@@ -194,8 +234,14 @@ export async function recognizeCanvas(canvas: HTMLCanvasElement, language = 'en'
     }
 }
 
+// How much reading was done (for the performance report of the Decky plugin)
+export const ocrStats = { reads: 0, ms: 0 }
+
 async function readCanvas(worker: Worker, canvas: HTMLCanvasElement, maxGap: number): Promise<OcrResult> {
-    const result = await worker.recognize(canvas, {}, { text: true, blocks: true })
+    const started = Date.now()
+    const result = await track(worker.recognize(canvas, {}, { text: true, blocks: true }))
+    ocrStats.reads++
+    ocrStats.ms += Date.now() - started
 
     const lines: OcrLine[] = []
 
@@ -258,8 +304,14 @@ async function readCanvas(worker: Worker, canvas: HTMLCanvasElement, maxGap: num
     return { text: lines.map(line => line.text).join('\n'), confidence, lines }
 }
 
-export async function terminateOcr(): Promise<void> {
+/** The stream is closed: nothing reads any more. */
+export function terminateOcr(): Promise<void> {
     closed = true
+    return shutDownReader()
+}
+
+async function shutDownReader(): Promise<void> {
+    markReaderShutdown()
     // The readings that wait for the reader give up (and the next reader starts with a clean slate)
     abortReading()
     renewAbort()
@@ -269,9 +321,14 @@ export async function terminateOcr(): Promise<void> {
 
     const pending = workerPromise
     workerPromise = null
+    // Taken now: what is under way on this reader (nothing new is started on it from here on)
+    const busy = Array.from(running).map(call => call.catch(() => undefined))
 
     try {
         const worker = await pending
+        let timer: ReturnType<typeof setTimeout> | undefined
+        await Promise.race([Promise.all(busy), new Promise((resolve) => { timer = setTimeout(resolve, SHUTDOWN_WAIT) })])
+        clearTimeout(timer)
         await worker.terminate()
     } catch(error) {
         // Nothing to clean up

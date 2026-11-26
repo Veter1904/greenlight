@@ -5,3 +5,6 @@ packages/docs/out
 packages/docs/.source
 dist/
 packages/pages/public
+
+# TypeScript incremental build info
+*.tsbuildinfo

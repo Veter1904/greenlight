@@ -68,7 +68,7 @@ export function inkMasks(data: Uint8ClampedArray, width: number, height: number,
  * The same as inkMasks, in slices: after every few milliseconds of work `breathe` is awaited, so the page can draw the game and
  * read the pad in between (a big picture takes 20 ms or more in one piece, and the camera stutters).
  */
-export async function inkMasksInSlices(data: Uint8ClampedArray, width: number, height: number, polarities: Polarity[], breathe: () => Promise<void>, sliceMs = 5): Promise<Array<{ mask: Uint8Array; count: number }>> {
+export async function inkMasksInSlices(data: Uint8ClampedArray, width: number, height: number, polarities: Polarity[], breathe: () => Promise<void>, sliceMs = 5, minRadius = 0): Promise<Array<{ mask: Uint8Array; count: number }>> {
     const pixels = width * height
     const luma = new Uint8Array(pixels)
     let slice = Date.now()
@@ -94,7 +94,7 @@ export async function inkMasksInSlices(data: Uint8ClampedArray, width: number, h
         }
     }
 
-    const radius = Math.max(4, Math.round(width * 0.014))
+    const radius = Math.max(4, minRadius, Math.round(width * 0.014))
     const results = polarities.map(() => ({ mask: new Uint8Array(pixels), count: 0 }))
 
     for(let y = 0; y < height; y++){
